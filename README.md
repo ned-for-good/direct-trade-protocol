@@ -1,0 +1,89 @@
+# Direct Trade Protocol (DTP)
+
+**A platform-agnostic protocol for direct, agent-native trade of physical goods with on-chain settlement.**
+
+---
+
+## What DTP Is
+
+DTP is a coordination protocol — a set of rules, schemas, and state machines that define how two parties (a buyer and a seller) can negotiate, contract, and settle a trade of physical goods without a broker in the middle.
+
+Think of it like HTTP for commerce: HTTP defines how computers exchange information on the web, and any server or browser can implement it. DTP defines how trade parties exchange intentions, offers, and contracts, and any platform, agent, or application can implement it.
+
+DTP is **not** an app, a marketplace, or a company. It is infrastructure.
+
+---
+
+## Why It Exists
+
+The U.S. food supply chain alone spends an estimated 20–30% of total value (~$375–750B annually) on middlemen and manual coordination — faxes, spreadsheets, phone calls, paper checks, 30–90 day payment terms. That coordination tax doesn't add value. It just extracts it.
+
+DTP replaces coordination-by-intermediary with coordination-by-protocol: open rules, smart contract escrow, automatic settlement, and on-chain reputation. The value that was flowing to brokers flows back to producers and buyers.
+
+Food is the first target. The protocol is industry-agnostic.
+
+---
+
+## How It Works
+
+```
+Buyer posts TradeIntent
+       ↓
+Sellers post Offers
+       ↓
+Matching (off-chain scoring, on-chain commitment)
+       ↓
+Contract formed → Escrow locked
+       ↓
+Delivery + Attestation
+       ↓
+Settlement → Escrow released
+```
+
+1. **TradeIntent** — A buyer broadcasts what they want: product, quantity, quality specs, required certifications, delivery window, price ceiling.
+2. **Offer** — Sellers respond with what they can provide, including their actual certifications, pricing, and delivery terms.
+3. **Matching** — Off-chain matching logic scores and ranks offers against the intent. The accepted match is committed on-chain.
+4. **Contract + Escrow** — A smart contract locks buyer funds and encodes the agreed delivery conditions.
+5. **Fulfillment** — Seller delivers. Both parties attest to delivery on-chain.
+6. **Settlement** — Escrow releases to the seller. Reputation scores update. Audit trail is permanent.
+
+---
+
+## Design Principles
+
+- **Platform-agnostic** — Any system that can speak JSON can implement DTP. No vendor lock-in.
+- **Agent-native** — Designed from the start for AI agents to operate as buyers, sellers, and matching solvers. Human interfaces are a thin layer on top.
+- **No speculative token** — Settlement in stablecoins (USDC). DTP has no native token and creates no speculative instrument.
+- **Non-extractive** — The protocol charges no rent. Any fees are set by governance, minimal by design, and flow to infrastructure — not a middleman.
+- **Verifiable claims** — Certifications, grades, and credentials are referenced with issuer + expiry + verification source. Nothing is self-reported without verification.
+- **Transparent audit trail** — Every state transition is an on-chain event. The full history of any trade is permanently readable.
+
+---
+
+## Repository Structure
+
+```
+direct-trade-protocol/
+  README.md         ← this file
+  SPEC.md           ← the full protocol specification
+  contracts/        ← NEAR smart contracts (Rust) — reference settlement implementation
+  sdk/              ← TypeScript SDK — reference client implementation
+  examples/         ← example integrations (human UI, agent client)
+  docs/             ← extended documentation
+```
+
+---
+
+## Status
+
+**Pre-alpha.** Active development. Spec and reference contracts are being written now.
+
+Reference chain: [NEAR Protocol](https://near.org) (fast finality, agent-native accounts, USDC support, TEE-secured AI cloud).
+
+---
+
+## Built By
+
+[Ned](https://github.com/ned-for-good) and [George Milton](https://github.com/georgemilton).
+
+Rooted in George's 13 years building in the food industry (Yellowbird Foods). Designed to make the food supply chain work for producers, retailers, and communities — not extractive intermediaries.
