@@ -91,6 +91,89 @@ Reputation is built on-chain from completed trades. It cannot be manually set or
 
 ---
 
+### 2.4 RelationshipRecord
+
+A **RelationshipRecord** captures the bilateral trade history between two specific parties. Unlike Reputation (which reflects a party's general track record across all counterparties), a RelationshipRecord reflects the specific history between Party A and Party B.
+
+RelationshipRecords are computed automatically from completed trades. They cannot be manually created or edited. Either party can view their shared RelationshipRecord. Third parties can see aggregate relationship strength (tier, trade count, relationship age) but not individual trade values or terms.
+
+```json
+{
+  "relationship_id": "string",
+  "party_a": "string",
+  "party_b": "string",
+  "first_trade_at": "ISO8601",
+  "last_trade_at": "ISO8601",
+  "trades_completed": "integer",
+  "total_volume_usd": "decimal",
+  "dispute_rate": "float",
+  "on_time_delivery_rate": "float",
+  "tier": "RelationshipTier",
+  "standing_agreements": ["StandingAgreementRef"],
+  "updated_at": "ISO8601"
+}
+```
+
+**RelationshipTier** is derived automatically from trade history:
+
+| Tier | Criteria |
+|---|---|
+| `NEW` | First trade, or fewer than 3 completed trades |
+| `ESTABLISHED` | 3+ completed trades or 6+ months of history |
+| `PREFERRED` | 10+ trades, or $50k+ lifetime volume, or active StandingAgreement |
+| `STRATEGIC` | Multi-year history, $250k+ lifetime volume, or multi-year StandingAgreement |
+
+Tier thresholds are protocol-defined and version-controlled. Tier is visible to both parties and to the matching engine.
+
+**How RelationshipTier affects the protocol:**
+- Matching engine weights counterparty relationship tier in scoring — an established supplier ranks higher than an unknown one for the same goods at the same price.
+- Agents can be configured to auto-accept offers from `PREFERRED` or `STRATEGIC` counterparties within wider price bounds than they would for new counterparties.
+- Sellers may attach relationship-conditional pricing tiers (see PricingStructure) — pricing that is only unlocked for parties at a certain tier.
+
+---
+
+### 2.5 StandingAgreement
+
+A **StandingAgreement** is a long-term or recurring trading relationship formally acknowledged on-chain by both parties. It is not a single trade — it is a framework that governs a series of trades over a defined period.
+
+```json
+{
+  "agreement_id": "string",
+  "version": "string",
+  "buyer": "PartyRef",
+  "seller": "PartyRef",
+  "goods": "GoodsSpec",
+  "terms": {
+    "period_start": "ISO8601",
+    "period_end": "ISO8601",
+    "volume_commitment": {
+      "min_quantity_per_period": {"amount": "decimal", "unit": "string"},
+      "period": "monthly | quarterly | annual",
+      "committed_total": {"amount": "decimal", "unit": "string"}
+    },
+    "pricing": "PricingStructure",
+    "delivery_cadence": "string | null",
+    "renewal": "auto | manual | none"
+  },
+  "status": "AgreementStatus",
+  "buyer_signed_at": "ISO8601 | null",
+  "seller_signed_at": "ISO8601 | null",
+  "created_at": "ISO8601"
+}
+```
+
+**AgreementStatus:**
+```
+PROPOSED → COUNTERED → ACTIVE → COMPLETED
+                     ↘ TERMINATED
+```
+
+Both parties must sign (on-chain attestation) for the agreement to become `ACTIVE`. Once active, individual trades that fulfil the agreement reference it via `standing_agreement_id` and inherit its pricing and terms automatically.
+
+**Effect on agent autonomy:** An agent operating under an active StandingAgreement can place orders that conform to the agreement terms autonomously — no per-trade human approval required. The agreement itself was the human approval decision.
+
+---
+
 ## 3. Message Types
 
 ### 3.1 TradeIntent
