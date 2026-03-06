@@ -193,19 +193,93 @@ Only the `*_details` block matching `product_type` is required. Others may be om
 }
 ```
 
-### 3.4 PaymentSpec
+### 3.4 PackStructure
+
+Describes the physical packaging hierarchy of goods. Used in SupplyListings to define how goods are packaged and shipped. The protocol uses pack structure to derive suggested pricing tier breakpoints automatically.
 
 ```json
 {
+  "unit_size": {
+    "amount": "decimal",
+    "unit": "string"
+  },
+  "units_per_case": "integer",
+  "cases_per_pallet": "integer",
+  "pallets_per_truckload": "integer | null",
+  "moq": {
+    "amount": "decimal",
+    "unit": "string",
+    "label": "string"
+  }
+}
+```
+
+**Example:** A seller listing 25 lb bags of organic black pepper, 4 bags/case, 40 cases/pallet:
+```json
+{
+  "unit_size": {"amount": 25, "unit": "lb"},
+  "units_per_case": 4,
+  "cases_per_pallet": 40,
+  "moq": {"amount": 100, "unit": "lb", "label": "1 case"}
+}
+```
+
+The protocol derives natural tier breakpoints: 1 case (100 lb), 10 cases (1,000 lb), 1 pallet (4,000 lb), etc., and presents these as suggested tiers. The seller confirms or adjusts.
+
+---
+
+### 3.5 PricingStructure
+
+Used in both SupplyListings (seller side) and TradeIntents (buyer side). Replaces simple `price_per_unit`.
+
+**Seller PricingStructure:**
+```json
+{
+  "model": "tiered | flat | negotiable",
   "currency": "USDC",
-  "price_per_unit": "decimal",
-  "total_ceiling": "decimal",
+  "asking_price_per_unit": "decimal",
+  "tiers": [
+    {
+      "min_quantity": {"amount": "decimal", "unit": "string"},
+      "max_quantity": {"amount": "decimal", "unit": "string"} ,
+      "price_per_unit": "decimal",
+      "label": "string | null"
+    }
+  ]
+}
+```
+
+`asking_price_per_unit` is the published starting price — the price at the lowest tier. Higher-volume tiers offer lower unit prices.
+
+**Floor price is not published.** It is private to the seller and held in the seller's agent context (see Section 10). Buyers never see the seller's floor or cost basis.
+
+**Buyer PricingStructure:**
+```json
+{
+  "currency": "USDC",
+  "ceiling_price_per_unit": "decimal",
+  "desired_quantity": {
+    "amount": "decimal",
+    "unit": "string"
+  }
+}
+```
+
+`ceiling_price_per_unit` is the maximum the buyer will pay. The matching engine surfaces matches at or below this ceiling.
+
+**Quantity flexibility is a protocol recommendation, not a buyer-set parameter.** When a buyer posts a TradeIntent at 400 lbs, the matching engine surfaces the exact-quantity price AND adjacent tier comparisons — e.g., "at 500 lbs (half pallet) you save 9% per unit." The buyer (or buyer's agent) decides whether to adjust quantity. No hard flex range is required upfront.
+
+---
+
+### 3.6 PaymentSpec
+
+```json
+{
+  "pricing": "PricingStructure",
   "escrow_required": true,
   "payment_on": "delivery_attestation | inspection_period_end"
 }
 ```
-
-`price_per_unit` is the **maximum** the buyer will pay (in a TradeIntent). The accepted offer price may be lower.
 
 `escrow_required` is always `true` in v0.
 
@@ -435,7 +509,21 @@ Eligible candidates are scored on four dimensions (equal weight in v0):
 
 The top 3 candidates are surfaced to each party as recommended matches.
 
-### 4.4 Solver Role
+### 4.4 Tier Comparison Surfacing
+
+When the matching engine surfaces a match to a buyer, it also computes and surfaces adjacent tier comparisons — even if the buyer did not request them. This allows buyers and buyer agents to evaluate quantity flexibility without having to recalculate manually.
+
+**Example output for a buyer who posted 400 lbs at a $4.50/lb ceiling:**
+```
+Match: Organic basil — Green Valley Farm
+  Your quantity (400 lb):     $4.20/lb  =  $1,680 total
+  Next tier   (500 lb, ½ pallet): $3.80/lb  =  $1,900 total  [-10% per unit, +13% total]
+  Pallet tier (1,000 lb):     $3.50/lb  =  $3,500 total  [-17% per unit, +108% total]
+```
+
+The buyer or buyer's agent decides whether to adjust quantity. No quantity commitment is made until contract formation.
+
+### 4.5 Solver Role
 
 In v0, the solver is a human operator or a simple scoring script. The protocol does not mandate solver implementation — any conforming matching algorithm may be used. Future versions will define a decentralized solver network.
 
@@ -491,7 +579,53 @@ Implementors are not required to use the reference contracts or SDK. Any conform
 
 ---
 
-## 9. Out of Scope (v0)
+## 9. Agent Autonomy Context
+
+DTP is designed for both human-operated and agent-operated parties. To enable autonomous agent behavior, each party may maintain a private **Agent Autonomy Context** — a set of parameters that governs how their agent acts on their behalf.
+
+**Agent Autonomy Context is not a protocol message.** It is never transmitted, never stored on-chain, and never visible to the counterparty. It is private configuration held by the party's agent.
+
+### 9.1 Seller Agent Context
+
+```json
+{
+  "party_id": "string",
+  "cogs_per_unit": "decimal",
+  "target_margin_pct": "decimal",
+  "minimum_margin_pct": "decimal",
+  "pricing_guidelines": {
+    "auto_accept_above_floor": true,
+    "auto_counter_below_floor": true,
+    "escalate_to_human_below_margin_pct": "decimal"
+  }
+}
+```
+
+The seller's agent derives its floor price from `cogs_per_unit` and `minimum_margin_pct`. It publishes asking prices and tiers based on `target_margin_pct`. It can autonomously accept any offer above the derived floor, counter-offer below it, or escalate to a human if an offer falls below the escalation threshold.
+
+**Buyers never see COGS, floor price, or margin guidelines.** They see only the published asking price and tiers.
+
+### 9.2 Buyer Agent Context
+
+```json
+{
+  "party_id": "string",
+  "budget_ceiling_per_unit": "decimal",
+  "quantity_guidelines": {
+    "auto_accept_tier_upgrade_if_savings_pct_gte": "decimal"
+  }
+}
+```
+
+The buyer's agent can autonomously accept a quantity tier upgrade if the per-unit savings meet or exceed the configured threshold — without requiring human input for every pricing decision.
+
+### 9.3 TEE Integration
+
+In deployments using NEAR AI Cloud's Trusted Execution Environment (TEE), Agent Autonomy Context runs inside hardware-secured infrastructure where the context is encrypted and isolated — even the infrastructure operator cannot read it. This is the recommended deployment model for production agent autonomy.
+
+---
+
+## 10. Out of Scope (v0)
 
 The following are explicitly out of scope for DTP v0 and may be addressed in future versions:
 
