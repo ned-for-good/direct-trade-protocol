@@ -109,6 +109,9 @@ impl DTPContract {
     fn validate_finance_terms(&self, finance: &Option<FinanceTerms>) {
         if let Some(f) = finance {
             assert!(f.net_days <= 60, "net_days must be <= 60 in v1");
+            if f.paca_covered {
+                assert!(f.net_days <= 30, "PACA-covered trades must have net_days <= 30");
+            }
             assert!(f.finance_fee_bps <= 5000, "finance_fee_bps must be <= 5000");
 
             if matches!(f.financing_mode, FinancingMode::EscrowOnly) {

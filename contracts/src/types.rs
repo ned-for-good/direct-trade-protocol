@@ -264,6 +264,8 @@ pub struct FinanceTerms {
     pub payment_timing: PaymentTiming,
     /// 0 means immediate at settlement event. In v1 this is capped at 60 days.
     pub net_days: u16,
+    /// True when transaction is PACA-covered produce.
+    pub paca_covered: bool,
     pub financing_mode: FinancingMode,
     /// Optional in v1; defaults to protocol pool when FinancingMode::LpPool.
     pub liquidity_pool_id: Option<String>,

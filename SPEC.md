@@ -399,6 +399,7 @@ Used in both SupplyListings (seller side) and TradeIntents (buyer side). Replace
 {
   "payment_timing": "delivery_attestation | inspection_period_end",
   "net_days": 0,
+  "paca_covered": false,
   "financing_mode": "escrow_only | lp_pool",
   "liquidity_pool_id": "string | null",
   "financer_id": "PartyRef | null",
