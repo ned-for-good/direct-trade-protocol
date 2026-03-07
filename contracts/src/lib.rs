@@ -1082,3 +1082,56 @@ pub enum DisputeResolution {
     Buyer,
     Seller,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owner() -> AccountId {
+        "owner.testnet".parse().unwrap()
+    }
+
+    fn sample_finance(net_days: u16, paca_covered: bool) -> FinanceTerms {
+        FinanceTerms {
+            payment_timing: PaymentTiming::DeliveryAttestation,
+            net_days,
+            paca_covered,
+            financing_mode: FinancingMode::LpPool,
+            liquidity_pool_id: Some("default-lp".to_string()),
+            financer_id: None,
+            finance_fee_bps: 250,
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "PACA-covered trades must have net_days <= 30")]
+    fn finance_validation_enforces_paca_cap() {
+        let c = DTPContract::new(owner());
+        let finance = Some(sample_finance(45, true));
+        c.validate_finance_terms(&finance);
+    }
+
+    #[test]
+    fn finance_validation_accepts_non_paca_sixty_days() {
+        let c = DTPContract::new(owner());
+        let finance = Some(sample_finance(60, false));
+        c.validate_finance_terms(&finance);
+    }
+
+    #[test]
+    #[should_panic(expected = "freight_allowance cannot exceed estimated_freight")]
+    fn freight_validation_rejects_over_allowance() {
+        let c = DTPContract::new(owner());
+        let freight = Some(FreightTerms {
+            payer: FreightPayer::Buyer,
+            estimated_freight: 100,
+            freight_allowance: 101,
+            quote_source: FreightQuoteSource::ManualEstimate,
+            quote_ref: None,
+            quoted_at: 10,
+            quote_expires_at: 20,
+            booked_at_contract: false,
+        });
+        c.validate_freight_terms(&freight);
+    }
+}
