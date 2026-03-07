@@ -65,9 +65,11 @@ Buyers are not required to pick a term schedule. In escrow-only mode, settlement
 The first iteration intentionally keeps underwriting and lender routing simple:
 
 - one protocol LP pool (default)
-- constrained term options
+- prepay-anytime balances with deterministic maturity caps (60 days standard, 30 days PACA)
 - on-chain recording of financing terms per trade
 - future-compatible fields for buyer-selected funding partner and pool choice
+
+For context, common wholesale early-pay terms like 2% in 10 business days (~14 calendar days) imply ~67.6% effective APR. A 30% LP yield target still materially reduces finance drag while paying strong returns to early LP participants.
 
 This gives immediate utility for working-capital pressure while preserving a clean path toward deeper DeFi integration in later versions.
 

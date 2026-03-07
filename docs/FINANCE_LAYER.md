@@ -35,6 +35,31 @@ This gives sellers immediate cashflow while keeping lender returns simple and le
 
 This keeps buyer UX simple, keeps seller economics predictable, and lets DTP collect repayment-quality data before opening lender routing and lender marketplaces.
 
+## Market benchmark and value capture
+
+Large wholesale distributors commonly offer early-pay terms like **2% discount if paid within 10 business days** (about 14 calendar days). That implies roughly **67.6% effective APR** for the payer-side capital (daily compounding assumption).
+
+DTP v1 LP policy targets 30% effective APR for LPs. Even at that high investor yield, the financing drag is still cut by about half relative to a 67.6% benchmark while directing economics to protocol participants instead of legacy intermediaries.
+
+## Default mitigation and underwriting controls (v1)
+
+To protect LP capital while reputation data is still thin, financed access should be gated:
+
+- buyer identity and business verification required before financing eligibility
+- baseline creditworthiness check (trade references, payment history where available, and basic risk score)
+- conservative initial exposure limits per buyer and per counterparty pair
+- financing offered only after minimum protocol activity thresholds are met (or explicit manual approval)
+- dynamic throttles: reduce or pause financed limits after late payments or dispute spikes
+- short review cadence on LP health metrics (delinquency, default, recovery, concentration)
+
+## Rollout posture
+
+Start small and de-risk in production.
+
+- launch with a modest LP size (not a large day-one pool)
+- ramp limits and total pool capacity only after repayment performance validates assumptions
+- treat early cycles as underwriting calibration, not growth maximization
+
 ## v2 direction (not in scope yet)
 
 - buyer-selected funding partner
