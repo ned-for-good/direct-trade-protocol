@@ -47,6 +47,8 @@ pub struct DTPContract {
 
     /// Append-only audit trail
     pub audit_log: Vector<AuditEvent>,
+    /// Maps entity_id → list of audit_log indices for O(1) entity filtering
+    pub audit_index: LookupMap<String, Vec<u32>>,
 
     /// Counter for generating sequential IDs
     pub id_counter: u64,
@@ -75,6 +77,7 @@ impl DTPContract {
             standing_agreements: IterableMap::new(b"a"),
             relationships: LookupMap::new(b"r"),
             audit_log: Vector::new(b"e"),
+            audit_index: LookupMap::new(b"x"),
             id_counter: 0,
         }
     }
@@ -83,9 +86,9 @@ impl DTPContract {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    fn next_id(&mut self) -> String {
+    fn next_id_for(&mut self, prefix: &str) -> String {
         self.id_counter += 1;
-        format!("dtp-{}", self.id_counter)
+        format!("{}{}", prefix, self.id_counter)
     }
 
     fn now_ms(&self) -> u64 {
@@ -93,17 +96,18 @@ impl DTPContract {
     }
 
     fn emit(&mut self, event: AuditEvent) {
+        let idx = self.audit_log.len();
+        let entity_id = event.entity_id.clone();
         let json = serde_json::to_string(&event).unwrap_or_default();
         self.audit_log.push(event);
+        let mut indices = self.audit_index.get(&entity_id).cloned().unwrap_or_default();
+        indices.push(idx);
+        self.audit_index.insert(entity_id, indices);
         near_sdk::log!("DTP_EVENT:{}", json);
     }
 
     fn require_party(&self, account: &AccountId) {
         assert!(self.parties.contains_key(account), "Party not registered");
-    }
-
-    fn require_owner(&self) {
-        assert_eq!(env::predecessor_account_id(), self.owner, "Owner only");
     }
 
     fn validate_finance_terms(&self, finance: &Option<FinanceTerms>) {
@@ -192,7 +196,7 @@ impl DTPContract {
         self.validate_finance_terms(&finance);
         self.validate_freight_terms(&freight);
 
-        let intent_id = self.next_id();
+        let intent_id = self.next_id_for("int-");
         let now = self.now_ms();
 
         let intent = TradeIntent {
@@ -270,7 +274,7 @@ impl DTPContract {
         self.validate_finance_terms(&finance);
         self.validate_freight_terms(&freight);
 
-        let listing_id = self.next_id();
+        let listing_id = self.next_id_for("lst-");
         let now = self.now_ms();
 
         let listing = SupplyListing {
@@ -362,7 +366,7 @@ impl DTPContract {
             }
         }
 
-        let offer_id = self.next_id();
+        let offer_id = self.next_id_for("off-");
         let now = self.now_ms();
 
         let offer = Offer {
@@ -488,7 +492,7 @@ impl DTPContract {
         offer.status = OfferStatus::Accepted;
         self.offers.insert(offer_id.clone(), offer.clone());
 
-        let contract_id = self.next_id();
+        let contract_id = self.next_id_for("ctr-");
         let now = self.now_ms();
 
         // TODO: Replace this placeholder with actual NEP-141 USDC escrow lock.
@@ -572,7 +576,7 @@ impl DTPContract {
         assert!(!already_fulfilled, "Fulfillment already exists for this contract");
 
         let now = self.now_ms();
-        let fulfillment_id = self.next_id();
+        let fulfillment_id = self.next_id_for("ful-");
 
         let fulfillment = Fulfillment {
             fulfillment_id: fulfillment_id.clone(),
@@ -657,7 +661,7 @@ impl DTPContract {
         dispute_loser: Option<AccountId>,
     ) -> String {
         let now = self.now_ms();
-        let settlement_id = self.next_id();
+        let settlement_id = self.next_id_for("set-");
 
         let total_deductions: Amount = deductions.iter().map(|d| d.amount).sum();
         let net_amount = contract.total_value.saturating_sub(total_deductions);
@@ -871,7 +875,7 @@ impl DTPContract {
         self.require_party(&proposer);
         self.require_party(&counterparty);
 
-        let agreement_id = self.next_id();
+        let agreement_id = self.next_id_for("agr-");
         let now = self.now_ms();
 
         // Proposer signs their side immediately; counterparty signs via sign_standing_agreement()
@@ -970,7 +974,9 @@ impl DTPContract {
     pub fn check_match(&self, intent_id: String, listing_id: String) -> MatchResult {
         let intent = self.intents.get(&intent_id).cloned().expect("Intent not found");
         let listing = self.listings.get(&listing_id).cloned().expect("Listing not found");
-        let result = matching::check_listing_vs_intent(&intent, &listing, self.now_ms());
+        let seller_rep = self.parties.get(&listing.seller)
+            .map(|p| p.reputation.score);
+        let result = matching::check_listing_vs_intent(&intent, &listing, self.now_ms(), seller_rep);
         MatchResult {
             eligible: result.eligible,
             score: result.score,
@@ -1034,26 +1040,13 @@ impl DTPContract {
 
     /// Get paginated audit trail entries for a specific entity.
     pub fn get_audit_trail(&self, entity_id: String, offset: u64, limit: u64) -> Vec<AuditEvent> {
-        let total = self.audit_log.len() as u64;
-        let mut results = vec![];
-        let mut count = 0u64;
-        let mut skipped = 0u64;
-
-        for i in 0..total {
-            let event = self.audit_log.get(i as u32).cloned().unwrap();
-            if event.entity_id == entity_id {
-                if skipped < offset {
-                    skipped += 1;
-                    continue;
-                }
-                if count >= limit {
-                    break;
-                }
-                results.push(event);
-                count += 1;
-            }
-        }
-        results
+        let indices = self.audit_index.get(&entity_id).cloned().unwrap_or_default();
+        let start = (offset as usize).min(indices.len());
+        let end = ((offset + limit) as usize).min(indices.len());
+        indices[start..end]
+            .iter()
+            .map(|&i| self.audit_log.get(i).cloned().unwrap())
+            .collect()
     }
 
     // -----------------------------------------------------------------------

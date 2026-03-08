@@ -1,4 +1,4 @@
-use crate::types::{GoodsSpec, DeliverySpec, BuyerPricing, SellerPricing, TradeIntent, SupplyListing};
+use crate::types::{TradeIntent, SupplyListing};
 
 /// Result of an eligibility check between a TradeIntent and a SupplyListing.
 #[derive(Debug)]
@@ -11,10 +11,14 @@ pub struct MatchEligibility {
 
 /// Check whether a SupplyListing is eligible to match a TradeIntent.
 /// Returns eligibility status, failure reasons, and a match score.
+///
+/// `seller_reputation_score`: the seller's `ReputationRecord.score` (0–10000).
+/// Pass `None` for new sellers with no on-chain history (defaults to 10000).
 pub fn check_listing_vs_intent(
     intent: &TradeIntent,
     listing: &SupplyListing,
     now_ms: u64,
+    seller_reputation_score: Option<u32>,
 ) -> MatchEligibility {
     let mut reasons: Vec<String> = vec![];
 
@@ -68,7 +72,7 @@ pub fn check_listing_vs_intent(
 
     // Score (only meaningful if eligible)
     let score = if eligible {
-        compute_match_score(intent, listing)
+        compute_match_score(intent, listing, seller_reputation_score.unwrap_or(10000))
     } else {
         0
     };
@@ -80,9 +84,9 @@ pub fn check_listing_vs_intent(
 /// Four dimensions, equal weight (2500 each):
 ///   1. Price alignment (lower listing price vs ceiling = better)
 ///   2. Delivery timing (more overlap = better)
-///   3. Seller reputation (passed in via listing.goods — using cert depth as proxy in v0)
+///   3. Seller reputation (ReputationRecord.score, 0–10000)
 ///   4. Certification depth (more certs than required = better)
-fn compute_match_score(intent: &TradeIntent, listing: &SupplyListing) -> u32 {
+fn compute_match_score(intent: &TradeIntent, listing: &SupplyListing, seller_reputation_score: u32) -> u32 {
     // 1. Price score: how far below the ceiling is the listing price?
     let price_score = {
         let ceiling = intent.pricing.ceiling_price_per_unit;
@@ -113,13 +117,9 @@ fn compute_match_score(intent: &TradeIntent, listing: &SupplyListing) -> u32 {
         pct.min(2500)
     };
 
-    // 3. Reputation score: placeholder using cert count as a depth proxy in v0.
-    //    TODO: replace with actual ReputationRecord.score lookup when party registry
-    //    is integrated into matching.
-    let reputation_score = {
-        let cert_count = listing.certifications.len() as u32;
-        (cert_count.min(5) * 500).min(2500)
-    };
+    // 3. Reputation score: seller's on-chain ReputationRecord.score (0–10000 basis points).
+    //    New sellers default to 10000 (no history = no penalty).
+    let reputation_score = (seller_reputation_score.min(10000) * 2500 / 10000).min(2500);
 
     // 4. Certification depth score: extra certs beyond required
     let cert_depth_score = {
@@ -136,8 +136,6 @@ fn compute_match_score(intent: &TradeIntent, listing: &SupplyListing) -> u32 {
 /// what prices look like at each listing price tier (for surfacing to buyer).
 pub struct TierComparison {
     pub label: String,
-    pub quantity_milliamount: u64,
-    pub unit: String,
     pub price_per_unit: u128,
     pub total_price: u128,
     pub pct_savings_vs_asking: i32,
@@ -172,8 +170,6 @@ pub fn compute_tier_comparisons(
                 tier.min_quantity.milliamount / 1000,
                 tier.min_quantity.unit
             )),
-            quantity_milliamount: tier.min_quantity.milliamount,
-            unit: tier.min_quantity.unit.clone(),
             price_per_unit: tier.price_per_unit,
             total_price: total,
             pct_savings_vs_asking: pct_savings,
