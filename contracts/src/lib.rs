@@ -36,6 +36,8 @@ pub struct DTPContract {
     // Core storage
     // -----------------------------------------------------------------------
     pub parties: LookupMap<AccountId, Party>,
+    pub catalogs: IterableMap<String, GoodsCatalogEntry>,
+    pub lots: IterableMap<String, GoodsLot>,
     pub intents: IterableMap<String, TradeIntent>,
     pub listings: IterableMap<String, SupplyListing>,
     pub offers: IterableMap<String, Offer>,
@@ -68,6 +70,8 @@ impl DTPContract {
             protocol_version: "0.1".to_string(),
             default_dispute_window_hours: 48,
             parties: LookupMap::new(b"p"),
+            catalogs: IterableMap::new(b"g"),
+            lots: IterableMap::new(b"h"),
             intents: IterableMap::new(b"i"),
             listings: IterableMap::new(b"l"),
             offers: IterableMap::new(b"o"),
@@ -108,6 +112,17 @@ impl DTPContract {
 
     fn require_party(&self, account: &AccountId) {
         assert!(self.parties.contains_key(account), "Party not registered");
+    }
+
+    /// Assert that the caller is the owner account or one of its authorized agents.
+    fn require_party_or_agent(&self, owner: &AccountId) {
+        let caller = env::predecessor_account_id();
+        if caller == *owner { return; }
+        let party = self.parties.get(owner).expect("Party not registered");
+        assert!(
+            party.authorized_agents.contains(&caller),
+            "Caller is not the owner or an authorized agent"
+        );
     }
 
     fn validate_finance_terms(&self, finance: &Option<FinanceTerms>) {
@@ -154,6 +169,7 @@ impl DTPContract {
             kyb: None,
             certifications: vec![],
             reputation: ReputationRecord::default(),
+            authorized_agents: vec![],
             created_at: self.now_ms(),
         };
         self.parties.insert(account.clone(), party.clone());
@@ -175,6 +191,33 @@ impl DTPContract {
         let mut party = self.parties.get(&account).cloned().expect("Party not registered");
         party.kyb = Some(kyb);
         self.parties.insert(account.clone(), party);
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent authorization
+    // -----------------------------------------------------------------------
+
+    /// Authorize an agent account to act on behalf of the caller's party.
+    /// Agents can post listings, manage catalog entries and lots, and sign
+    /// agreements. The owner key retains all capabilities.
+    pub fn authorize_agent(&mut self, agent: AccountId) {
+        let account = env::predecessor_account_id();
+        let mut party = self.parties.get(&account).cloned().expect("Party not registered");
+        assert_ne!(agent, account, "Cannot authorize self as agent");
+        if !party.authorized_agents.contains(&agent) {
+            party.authorized_agents.push(agent.clone());
+            self.parties.insert(account.clone(), party);
+            near_sdk::log!("Agent authorized: {} for {}", agent, account);
+        }
+    }
+
+    /// Revoke a previously authorized agent.
+    pub fn revoke_agent(&mut self, agent: AccountId) {
+        let account = env::predecessor_account_id();
+        let mut party = self.parties.get(&account).cloned().expect("Party not registered");
+        party.authorized_agents.retain(|a| a != &agent);
+        self.parties.insert(account.clone(), party);
+        near_sdk::log!("Agent revoked: {} from {}", agent, account);
     }
 
     // -----------------------------------------------------------------------
@@ -203,6 +246,7 @@ impl DTPContract {
             intent_id: intent_id.clone(),
             version: self.protocol_version.clone(),
             buyer: buyer.clone(),
+            catalog_id: None,
             goods,
             delivery,
             pricing,
@@ -281,6 +325,7 @@ impl DTPContract {
             listing_id: listing_id.clone(),
             version: self.protocol_version.clone(),
             seller: seller.clone(),
+            lot_id: None,
             goods,
             pack_structure,
             delivery,
@@ -445,24 +490,25 @@ impl DTPContract {
             "Offer not available for acceptance"
         );
 
-        // Determine buyer and seller based on offer target type
-        let (buyer, seller, intent_id, listing_id) = match &offer.target_type {
+        // Determine buyer, seller, and optional lot reference based on offer target type
+        let (buyer, seller, intent_id, listing_id, lot_id) = match &offer.target_type {
             OfferTargetType::Intent => {
                 let mut intent = self.intents.get(&offer.target_id).cloned().expect("Intent not found");
                 assert_eq!(intent.buyer, caller, "Only buyer can accept offer on their intent");
                 assert_eq!(intent.status, IntentStatus::Posted, "Intent not open");
                 intent.status = IntentStatus::Contracted;
                 intent.updated_at = self.now_ms();
-        self.intents.insert(intent.intent_id.clone(), intent.clone());
-                (caller.clone(), offer.offerer.clone(), Some(offer.target_id.clone()), None)
+                self.intents.insert(intent.intent_id.clone(), intent.clone());
+                (caller.clone(), offer.offerer.clone(), Some(offer.target_id.clone()), None, None)
             }
             OfferTargetType::Listing => {
                 let mut listing = self.listings.get(&offer.target_id).cloned().expect("Listing not found");
                 assert_eq!(listing.seller, caller, "Only seller can accept offer on their listing");
                 assert_eq!(listing.status, ListingStatus::Active, "Listing not active");
+                let lot_id = listing.lot_id.clone();
                 listing.status = ListingStatus::Contracted;
-        self.listings.insert(listing.listing_id.clone(), listing.clone());
-                (offer.offerer.clone(), caller.clone(), None, Some(offer.target_id.clone()))
+                self.listings.insert(listing.listing_id.clone(), listing.clone());
+                (offer.offerer.clone(), caller.clone(), None, Some(offer.target_id.clone()), lot_id)
             }
         };
 
@@ -502,6 +548,12 @@ impl DTPContract {
         //   3. Funds held until fulfillment or dispute resolution
         let escrow_ref = format!("escrow-placeholder-{}", contract_id);
 
+        // If this contract is backed by a lot, allocate the contracted quantity
+        if let Some(ref lid) = lot_id {
+            let contracted_milliamount = offer.goods.quantity.milliamount;
+            self.allocate_lot(lid, contracted_milliamount);
+        }
+
         let contract = TradeContract {
             contract_id: contract_id.clone(),
             version: self.protocol_version.clone(),
@@ -510,6 +562,7 @@ impl DTPContract {
             offer_id: offer_id.clone(),
             buyer: buyer.clone(),
             seller: seller.clone(),
+            lot_id,
             goods: offer.goods.clone(),
             delivery: offer.delivery.clone(),
             finance: offer.finance.clone(),
@@ -683,6 +736,19 @@ impl DTPContract {
         };
 
         self.settlements.insert(settlement_id.clone(), settlement.clone());
+
+        // Transfer lot ownership to buyer if this contract was backed by a lot
+        if let Some(ref lot_id) = contract.lot_id {
+            self.transfer_lot_ownership(
+                lot_id,
+                &contract.seller.clone(),
+                &contract.buyer.clone(),
+                contract.goods.quantity.milliamount,
+                contract.goods.quantity.unit.clone(),
+                &contract.contract_id.clone(),
+                now,
+            );
+        }
 
         contract.status = ContractStatus::Settled;
         contract.updated_at = now;
@@ -967,6 +1033,198 @@ impl DTPContract {
     }
 
     // -----------------------------------------------------------------------
+    // Goods catalog
+    // -----------------------------------------------------------------------
+
+    /// Create a new catalog entry. The caller becomes the owner.
+    /// catalog_id, owner, version, and timestamps are assigned by the contract.
+    pub fn create_catalog_entry(&mut self, entry: GoodsCatalogEntry) -> String {
+        let owner = env::predecessor_account_id();
+        self.require_party(&owner);
+
+        let catalog_id = self.next_id_for("cat-");
+        let now = self.now_ms();
+
+        let mut entry = entry;
+        entry.catalog_id = catalog_id.clone();
+        entry.owner = owner.clone();
+        entry.version = 1;
+        entry.created_at = now;
+        entry.updated_at = now;
+
+        self.catalogs.insert(catalog_id.clone(), entry.clone());
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(&catalog_id, &EventType::CatalogEntryCreated, now),
+            event_type: EventType::CatalogEntryCreated,
+            entity_type: EntityType::Catalog,
+            entity_id: catalog_id.clone(),
+            actor: owner.to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&entry),
+        });
+
+        catalog_id
+    }
+
+    /// Update an existing catalog entry. Caller must be the owner or an authorized agent.
+    /// Bumps version and updated_at; catalog_id and owner are immutable.
+    pub fn update_catalog_entry(&mut self, catalog_id: String, entry: GoodsCatalogEntry) {
+        let mut existing = self.catalogs.get(&catalog_id).cloned().expect("Catalog entry not found");
+        self.require_party_or_agent(&existing.owner);
+
+        let now = self.now_ms();
+        let mut entry = entry;
+        entry.catalog_id = existing.catalog_id.clone();
+        entry.owner = existing.owner.clone();
+        entry.version = existing.version + 1;
+        entry.created_at = existing.created_at;
+        entry.updated_at = now;
+        existing = entry;
+
+        self.catalogs.insert(catalog_id.clone(), existing.clone());
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(&catalog_id, &EventType::CatalogEntryUpdated, now),
+            event_type: EventType::CatalogEntryUpdated,
+            entity_type: EntityType::Catalog,
+            entity_id: catalog_id.clone(),
+            actor: env::predecessor_account_id().to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&existing),
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Goods lots
+    // -----------------------------------------------------------------------
+
+    /// Bring a new goods lot on-chain. Caller must be a registered party.
+    /// lot_id, owner, available_milliamount, provenance, status, and timestamps
+    /// are assigned by the contract; all other fields are caller-provided.
+    pub fn create_lot(&mut self, lot: GoodsLot) -> String {
+        let owner = env::predecessor_account_id();
+        self.require_party(&owner);
+        assert!(
+            self.catalogs.contains_key(&lot.catalog_id),
+            "Catalog entry not found"
+        );
+        assert!(lot.total_milliamount > 0, "Lot quantity must be > 0");
+
+        let lot_id = self.next_id_for("lot-");
+        let now = self.now_ms();
+
+        let mut lot = lot;
+        lot.lot_id = lot_id.clone();
+        lot.owner = owner.clone();
+        lot.origin_account = owner.clone();
+        lot.available_milliamount = lot.total_milliamount;
+        lot.provenance = vec![];
+        lot.status = LotStatus::Available;
+        lot.created_at = now;
+        lot.updated_at = now;
+
+        self.lots.insert(lot_id.clone(), lot.clone());
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(&lot_id, &EventType::LotCreated, now),
+            event_type: EventType::LotCreated,
+            entity_type: EntityType::Lot,
+            entity_id: lot_id.clone(),
+            actor: owner.to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&lot),
+        });
+
+        lot_id
+    }
+
+    /// Dispose of a lot (Spoiled, Donated, or Recalled). Caller must be the
+    /// owner or an authorized agent. Only available if lot has no active allocations.
+    pub fn dispose_lot(&mut self, lot_id: String, disposition: LotStatus, notes: Option<String>) {
+        let mut lot = self.lots.get(&lot_id).cloned().expect("Lot not found");
+        self.require_party_or_agent(&lot.owner);
+        assert!(
+            matches!(disposition, LotStatus::Spoiled | LotStatus::Donated | LotStatus::Recalled),
+            "disposition must be Spoiled, Donated, or Recalled"
+        );
+        assert!(
+            matches!(lot.status, LotStatus::Available | LotStatus::PartiallyAllocated),
+            "Lot cannot be disposed in current status"
+        );
+
+        let now = self.now_ms();
+        lot.status = disposition;
+        lot.updated_at = now;
+        self.lots.insert(lot_id.clone(), lot.clone());
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(&lot_id, &EventType::LotDisposed, now),
+            event_type: EventType::LotDisposed,
+            entity_type: EntityType::Lot,
+            entity_id: lot_id.clone(),
+            actor: env::predecessor_account_id().to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&notes),
+        });
+    }
+
+    /// Allocate quantity from a lot when a contract is formed.
+    /// Decrements available_milliamount and updates status.
+    fn allocate_lot(&mut self, lot_id: &str, milliamount: u64) {
+        let mut lot = self.lots.get(lot_id).cloned().expect("Lot not found");
+        assert!(
+            lot.available_milliamount >= milliamount,
+            "Insufficient lot quantity available"
+        );
+        lot.available_milliamount -= milliamount;
+        lot.status = if lot.available_milliamount == 0 {
+            LotStatus::FullyAllocated
+        } else {
+            LotStatus::PartiallyAllocated
+        };
+        lot.updated_at = self.now_ms();
+        self.lots.insert(lot_id.to_string(), lot);
+    }
+
+    /// Transfer lot ownership to the buyer at settlement.
+    /// Appends a ProvenanceEvent and updates owner and status.
+    fn transfer_lot_ownership(
+        &mut self,
+        lot_id: &str,
+        from: &AccountId,
+        to: &AccountId,
+        milliamount: u64,
+        unit: String,
+        contract_id: &str,
+        now: u64,
+    ) {
+        let mut lot = self.lots.get(lot_id).cloned().expect("Lot not found");
+        lot.owner = to.clone();
+        lot.status = LotStatus::Fulfilled;
+        lot.updated_at = now;
+        lot.provenance.push(ProvenanceEvent {
+            from: from.clone(),
+            to: to.clone(),
+            milliamount,
+            unit,
+            contract_id: contract_id.to_string(),
+            timestamp: now,
+        });
+        self.lots.insert(lot_id.to_string(), lot.clone());
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(lot_id, &EventType::LotOwnershipTransferred, now),
+            event_type: EventType::LotOwnershipTransferred,
+            entity_type: EntityType::Lot,
+            entity_id: lot_id.to_string(),
+            actor: contract_id.to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&lot),
+        });
+    }
+
+    // -----------------------------------------------------------------------
     // Matching helpers (read-only)
     // -----------------------------------------------------------------------
 
@@ -1003,6 +1261,14 @@ impl DTPContract {
 
     pub fn get_party(&self, account: AccountId) -> Option<Party> {
         self.parties.get(&account).cloned()
+    }
+
+    pub fn get_catalog_entry(&self, catalog_id: String) -> Option<GoodsCatalogEntry> {
+        self.catalogs.get(&catalog_id).cloned()
+    }
+
+    pub fn get_lot(&self, lot_id: String) -> Option<GoodsLot> {
+        self.lots.get(&lot_id).cloned()
     }
 
     pub fn get_intent(&self, intent_id: String) -> Option<TradeIntent> {
@@ -1161,6 +1427,69 @@ mod tests {
         "owner.testnet".parse().unwrap()
     }
 
+    fn sample_pack() -> PackDefinition {
+        PackDefinition {
+            trade_unit: "lb".to_string(),
+            case_weight: Some(Quantity::new(30_000, "lb")),
+            each: None,
+            case: None,
+            pallet: None,
+        }
+    }
+
+    fn sample_catalog_entry() -> GoodsCatalogEntry {
+        GoodsCatalogEntry {
+            catalog_id: String::new(),
+            owner: owner(),
+            version: 0,
+            gtin: None,
+            brand: None,
+            product_name: "Organic IQF Blueberries".to_string(),
+            internal_sku: Some("SKU-001".to_string()),
+            category: "food.produce.berries.blueberries".to_string(),
+            commodity: Some("blueberries".to_string()),
+            variety: Some("Duke".to_string()),
+            grade: Some("USDA Fancy".to_string()),
+            growing_region: None,
+            country_of_origin: Some("US".to_string()),
+            preparation: Some(Preparation::IQF),
+            storage_condition: StorageCondition::Frozen,
+            shelf_life_days: Some(365),
+            pack: sample_pack(),
+            catch_weight: false,
+            ingredients: None,
+            allergens: vec![],
+            nutrition_hash: None,
+            certifications: vec![],
+            attributes: vec![],
+            media_hashes: vec![],
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn sample_lot(catalog_id: String) -> GoodsLot {
+        GoodsLot {
+            lot_id: String::new(),
+            owner: owner(),
+            available_milliamount: 0,
+            provenance: vec![],
+            status: LotStatus::Available,
+            created_at: 0,
+            updated_at: 0,
+            catalog_id,
+            origin_account: owner(),
+            total_milliamount: 500_000, // 500 lb
+            unit: "lb".to_string(),
+            lot_number: Some("LOT-2026-001".to_string()),
+            pack_date: None,
+            harvest_date: None,
+            best_by: None,
+            lot_certifications: vec![],
+            input_lots: vec![],
+        }
+    }
+
     fn sample_finance(net_days: u16, paca_covered: bool) -> FinanceTerms {
         FinanceTerms {
             payment_timing: PaymentTiming::DeliveryAttestation,
@@ -1203,5 +1532,68 @@ mod tests {
             booked_at_contract: false,
         });
         c.validate_freight_terms(&freight);
+    }
+
+    fn setup_with_party() -> DTPContract {
+        near_sdk::testing_env!(near_sdk::test_utils::VMContextBuilder::new()
+            .predecessor_account_id(owner())
+            .build());
+        let mut c = DTPContract::new(owner());
+        c.parties.insert(owner(), Party {
+            party_id: owner(),
+            business_name: "Acme Foods".to_string(),
+            business_type: BusinessType::Producer,
+            jurisdiction: "US".to_string(),
+            kyb: None,
+            certifications: vec![],
+            reputation: ReputationRecord::default(),
+            authorized_agents: vec![],
+            created_at: 0,
+        });
+        c
+    }
+
+    #[test]
+    fn catalog_entry_creation_assigns_system_fields() {
+        let mut c = setup_with_party();
+        let id = c.create_catalog_entry(sample_catalog_entry());
+        let stored = c.get_catalog_entry(id.clone()).unwrap();
+        assert!(id.starts_with("cat-"), "ID should have cat- prefix, got {}", id);
+        assert_eq!(stored.catalog_id, id);
+        assert_eq!(stored.version, 1);
+        assert_eq!(stored.product_name, "Organic IQF Blueberries");
+        assert_eq!(stored.preparation, Some(Preparation::IQF));
+    }
+
+    #[test]
+    fn lot_creation_sets_available_equal_to_total() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+        let stored = c.get_lot(lot_id.clone()).unwrap();
+        assert!(lot_id.starts_with("lot-"), "ID should have lot- prefix");
+        assert_eq!(stored.status, LotStatus::Available);
+        assert_eq!(stored.available_milliamount, 500_000);
+        assert_eq!(stored.total_milliamount, 500_000);
+    }
+
+    #[test]
+    fn lot_allocation_decrements_available() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+        c.allocate_lot(&lot_id, 200_000); // 200 lb
+        let stored = c.get_lot(lot_id).unwrap();
+        assert_eq!(stored.available_milliamount, 300_000);
+        assert_eq!(stored.status, LotStatus::PartiallyAllocated);
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient lot quantity available")]
+    fn lot_allocation_rejects_over_quantity() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+        c.allocate_lot(&lot_id, 600_000); // more than 500 lb total
     }
 }

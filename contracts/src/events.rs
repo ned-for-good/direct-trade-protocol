@@ -30,6 +30,8 @@ pub enum EntityType {
     Settlement,
     StandingAgreement,
     Relationship,
+    Catalog,
+    Lot,
 }
 
 #[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
@@ -90,6 +92,15 @@ pub enum EventType {
 
     // Relationship
     RelationshipTierUpdated,
+
+    // Goods catalog
+    CatalogEntryCreated,
+    CatalogEntryUpdated,
+
+    // Goods lots
+    LotCreated,
+    LotDisposed,
+    LotOwnershipTransferred,
 }
 
 /// Compute SHA-256 hash of a JSON-serializable payload.
