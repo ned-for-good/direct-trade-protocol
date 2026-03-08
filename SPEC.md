@@ -24,17 +24,35 @@ Any platform, agent, or application that conforms to this specification can inte
 
 ## 2. Core Concepts
 
-### 2.1 Parties
+### 2.1 Identity Model
 
-A **Party** is any entity that participates in a DTP trade. Parties may be human-operated businesses or autonomous AI agents.
+Every DTP participant is identified by a **NEAR account** — a human-readable string like `acme-foods.near` or `green-valley-farm.near`. The NEAR account is the canonical identity layer: it owns cryptographic keys, signs transactions, holds USDC for escrow, and has persistent on-chain state.
+
+A **DTP Account** is a NEAR account that has registered a Party profile on the DTP contract. They are one-to-one: one account ID, one Party profile, one on-chain identity.
+
+**Key properties:**
+
+- **Role-neutral** — An account is not stamped as "buyer" or "seller" at registration. `business_type` is descriptive metadata (what kind of business you are), not a trade-role constraint. Role is declared per-trade, per-intent, and per-agreement. Any account can buy or sell.
+
+- **Cryptographic authentication** — The NEAR account keypair IS the login. When a transaction is signed from `acme-foods.near`, NEAR's runtime verifies the signature cryptographically. Wallets (NEAR Wallet, MyNearWallet, etc.) are the UX layer on top. There is no email/password at the protocol level.
+
+- **Agent sub-accounts** — NEAR supports hierarchical accounts natively. `agent.acme-foods.near` is cryptographically subordinate to `acme-foods.near`. This is the recommended pattern for agent delegation: the business owns the parent account; agents operate from sub-accounts the business controls.
+
+- **Portable by construction** — Data lives in the NEAR contract, not in any platform's database. Reputation, certifications, and trade history are readable by any DTP-compatible implementation. No platform can lock a party's identity inside their silo.
+
+- **Real-world anchoring** — The bridge between cryptographic identity and legal identity is the `KybRef` attestation (see 2.3). Optional at registration; not required for trading in v1.
+
+### 2.2 Party
+
+A **Party** is a NEAR account that has registered a profile on the DTP contract. Parties may be human-operated businesses, sole proprietors, cooperatives, or autonomous AI agents.
 
 ```json
 {
   "party_id": "string",
-  "account": "string",
   "business_name": "string",
   "business_type": "producer | distributor | retailer | cooperative | agent",
   "jurisdiction": "string",
+  "kyb": "KybRef | null",
   "certifications": ["CertificationRef"],
   "reputation": "ReputationRecord",
   "created_at": "ISO8601"
@@ -42,13 +60,39 @@ A **Party** is any entity that participates in a DTP trade. Parties may be human
 ```
 
 **Fields:**
-- `party_id` — unique identifier (NEAR account name or DID)
-- `account` — on-chain account address for settlement
-- `business_type` — role in the supply chain
-- `certifications` — array of `CertificationRef` objects (see 2.2)
-- `reputation` — on-chain reputation record derived from completed trades (see 2.3)
+- `party_id` — NEAR account ID (the canonical identity)
+- `business_type` — descriptive classification of the business; does not restrict trade role
+- `kyb` — optional legal entity identity attestation (see 2.3)
+- `certifications` — array of `CertificationRef` objects (see 2.4)
+- `reputation` — on-chain reputation record derived from completed trades (see 2.5)
 
-### 2.2 CertificationRef
+### 2.3 KybRef
+
+A `KybRef` (Know Your Business reference) optionally anchors a NEAR account to a real-world legal entity. Each Party holds at most one `KybRef`. It can be added or replaced at any time by the account holder.
+
+In v1, parties self-report their KYB data and reference an external provider's attestation. Future versions will allow KYB providers to write attestations directly to the party record.
+
+```json
+{
+  "legal_name": "string",
+  "tax_id": "string | null",
+  "jurisdiction": "string",
+  "provider": "string",
+  "attestation_ref": "string | null",
+  "issued_at": "ISO8601",
+  "expires_at": "ISO8601 | null",
+  "status": "Pending | Verified | Expired | Revoked"
+}
+```
+
+**Fields:**
+- `legal_name` — legal entity name as registered (may differ from `business_name`)
+- `tax_id` — EIN for US entities, VAT number for EU entities, etc.
+- `jurisdiction` — ISO 3166-1 alpha-2 country code of registration
+- `provider` — KYB attestation provider (e.g. `"stripe_identity"`, `"persona"`, `"manual"`)
+- `attestation_ref` — provider's attestation reference ID or verification URL
+
+### 2.4 CertificationRef  <!-- previously 2.2 -->
 
 A certification claim is never self-asserted. Every certification must carry a reference to the issuing authority and be independently verifiable.
 
@@ -73,7 +117,7 @@ A certification claim is never self-asserted. Every certification must carry a r
 - `HACCP` — Hazard Analysis Critical Control Points
 - `NON_GMO` — Non-GMO Project verified
 
-### 2.3 ReputationRecord
+### 2.5 ReputationRecord  <!-- previously 2.3 -->
 
 Reputation is built on-chain from completed trades. It cannot be manually set or imported.
 
@@ -93,7 +137,7 @@ Reputation is built on-chain from completed trades. It cannot be manually set or
 
 ---
 
-### 2.4 RelationshipRecord
+### 2.6 RelationshipRecord  <!-- previously 2.4 -->
 
 A **RelationshipRecord** captures the bilateral trade history between two specific parties. Unlike Reputation (which reflects a party's general track record across all counterparties), a RelationshipRecord reflects the specific history between Party A and Party B.
 
@@ -134,7 +178,7 @@ Tier thresholds are protocol-defined and version-controlled. Tier is visible to 
 
 ---
 
-### 2.5 StandingAgreement
+### 2.7 StandingAgreement  <!-- previously 2.5 -->
 
 A **StandingAgreement** is a long-term or recurring trading relationship formally acknowledged on-chain by both parties. It is not a single trade — it is a framework that governs a series of trades over a defined period.
 
@@ -171,6 +215,8 @@ PROPOSED → COUNTERED → ACTIVE → COMPLETED
 ```
 
 Both parties must sign (on-chain attestation) for the agreement to become `ACTIVE`. Once active, individual trades that fulfil the agreement reference it via `standing_agreement_id` and inherit its pricing and terms automatically.
+
+**ProposerRole:** The proposer declares their role in the agreement at proposal time — `Buyer` or `Seller`. Any registered account may propose in either role regardless of `business_type`. Role is per-agreement, not stamped on the account.
 
 **Effect on agent autonomy:** An agent operating under an active StandingAgreement can place orders that conform to the agreement terms autonomously — no per-trade human approval required. The agreement itself was the human approval decision.
 

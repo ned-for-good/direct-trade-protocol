@@ -56,6 +56,22 @@ Buyer posts TradeIntent          Seller posts SupplyListing
 
 ---
 
+## Identity Model
+
+Every DTP participant is a **DTP Account** — a NEAR account with a registered profile on the DTP contract. The NEAR account is the canonical identity: it owns keys, signs transactions, holds USDC for escrow, and carries on-chain reputation and trade history.
+
+**Accounts are role-neutral.** A farmer buys seeds and sells produce. A distributor buys from producers and sells to retailers. No account is permanently stamped as "buyer" or "seller" — role is declared per-trade and per-agreement.
+
+**Authentication is cryptographic.** The NEAR account keypair is the login. There is no email/password at the protocol level. Wallets (NEAR Wallet, MyNearWallet, etc.) are the UX layer on top.
+
+**Portability is structural.** Because a party's reputation, certifications, and trade history live in the NEAR contract — not in any platform's database — they are readable and usable by any DTP-compatible implementation. Accounts are never locked to a platform.
+
+**Real-world anchoring is opt-in.** Accounts can attach a `KybRef` (Know Your Business attestation) that links the NEAR account to a legal entity (business name, EIN/VAT, KYB provider). This is optional at registration and not required for trading in v1. Platforms may require it for access.
+
+**Agent delegation via sub-accounts.** NEAR accounts are hierarchical. `agent.acme-foods.near` is cryptographically subordinate to `acme-foods.near`. This is the recommended pattern for AI agent participation: the business controls the parent account; agents operate from sub-accounts with scoped permissions.
+
+---
+
 ## Finance Layer (v1)
 
 DTP v1 includes a simple finance layer for wholesale payment terms without turning the protocol into a lender marketplace on day one.

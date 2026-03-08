@@ -147,6 +147,7 @@ impl DTPContract {
             business_name,
             business_type,
             jurisdiction,
+            kyb: None,
             certifications: vec![],
             reputation: ReputationRecord::default(),
             created_at: self.now_ms(),
@@ -161,6 +162,15 @@ impl DTPContract {
         let mut party = self.parties.get(&account).cloned().expect("Party not registered");
         party.certifications.push(cert);
         self.parties.insert(account.clone(), party.clone());
+    }
+
+    /// Attach or replace a KYB (legal entity identity) attestation on the caller's account.
+    /// Each account holds at most one KybRef. Calling this again replaces the previous one.
+    pub fn add_kyb_attestation(&mut self, kyb: KybRef) {
+        let account = env::predecessor_account_id();
+        let mut party = self.parties.get(&account).cloned().expect("Party not registered");
+        party.kyb = Some(kyb);
+        self.parties.insert(account.clone(), party);
     }
 
     // -----------------------------------------------------------------------
@@ -555,6 +565,12 @@ impl DTPContract {
             "Contract not in deliverable state"
         );
 
+        // Guard against duplicate fulfillments for the same contract
+        let already_fulfilled = self.fulfillments
+            .iter()
+            .any(|(_, f)| f.contract_id == contract_id);
+        assert!(!already_fulfilled, "Fulfillment already exists for this contract");
+
         let now = self.now_ms();
         let fulfillment_id = self.next_id();
 
@@ -630,7 +646,7 @@ impl DTPContract {
         });
 
         // Trigger settlement
-        self.execute_settlement(fulfillment_id.clone(), contract, deductions)
+        self.execute_settlement(fulfillment_id.clone(), contract, deductions, None)
     }
 
     fn execute_settlement(
@@ -638,6 +654,7 @@ impl DTPContract {
         fulfillment_id: String,
         mut contract: TradeContract,
         deductions: Vec<Deduction>,
+        dispute_loser: Option<AccountId>,
     ) -> String {
         let now = self.now_ms();
         let settlement_id = self.next_id();
@@ -670,9 +687,11 @@ impl DTPContract {
         // Update relationship record
         self.update_relationship(&contract.buyer.clone(), &contract.seller.clone(), net_amount, true, now);
 
-        // Update reputation records
-        self.update_reputation(&contract.buyer, true, true);
-        self.update_reputation(&contract.seller, true, true);
+        // Update reputation records; if a dispute was resolved, the losing party is marked disputed
+        let buyer_disputed = dispute_loser.as_ref() == Some(&contract.buyer);
+        let seller_disputed = dispute_loser.as_ref() == Some(&contract.seller);
+        self.update_reputation(&contract.buyer, true, buyer_disputed, !buyer_disputed);
+        self.update_reputation(&contract.seller, true, seller_disputed, !seller_disputed);
 
         self.emit(AuditEvent {
             event_id: make_event_id(&settlement_id, &EventType::SettlementCreated, now),
@@ -718,6 +737,13 @@ impl DTPContract {
 
         let now = self.now_ms();
 
+        // Enforce dispute window: buyer must dispute within dispute_window_hours of seller attestation
+        let window_ms = contract.dispute_window_hours as u64 * 3_600_000;
+        assert!(
+            now <= fulfillment.seller_attestation.signed_at + window_ms,
+            "Dispute window has closed; use trigger_auto_settlement instead"
+        );
+
         fulfillment.status = FulfillmentStatus::Disputed;
         self.fulfillments.insert(fulfillment_id.clone(), fulfillment.clone());
 
@@ -734,6 +760,30 @@ impl DTPContract {
             timestamp: now,
             payload_hash: hash_payload(&reason),
         });
+    }
+
+    /// Trigger automatic settlement once the dispute window has elapsed without a buyer response.
+    /// Anyone may call this; the contract enforces that the window has actually passed.
+    pub fn trigger_auto_settlement(&mut self, fulfillment_id: String) -> String {
+        let fulfillment = self.fulfillments.get(&fulfillment_id).cloned()
+            .expect("Fulfillment not found");
+        let contract = self.contracts.get(&fulfillment.contract_id).cloned()
+            .expect("Contract not found");
+
+        assert_eq!(
+            fulfillment.status,
+            FulfillmentStatus::SellerAttested,
+            "Fulfillment not awaiting buyer attestation"
+        );
+
+        let now = self.now_ms();
+        let window_ms = contract.dispute_window_hours as u64 * 3_600_000;
+        assert!(
+            now > fulfillment.seller_attestation.signed_at + window_ms,
+            "Dispute window has not elapsed yet"
+        );
+
+        self.execute_settlement(fulfillment_id, contract, vec![], None)
     }
 
     /// Arbitrator resolves a dispute in favour of buyer or seller.
@@ -756,21 +806,34 @@ impl DTPContract {
 
         let now = self.now_ms();
 
-        let event_type = match resolution {
-            DisputeResolution::Buyer => EventType::ContractResolvedBuyer,
-            DisputeResolution::Seller => EventType::ContractResolvedSeller,
-        };
-
-        // Find the fulfillment for this contract
-        // In v0 we do a linear scan (acceptable for pilot scale)
+        // Find the fulfillment for this contract (linear scan, acceptable for pilot scale)
         let fulfillment_id = self.fulfillments
             .iter()
             .find(|(_, f)| f.contract_id == contract_id)
-            .map(|(id, _)| id.clone());
+            .map(|(id, _)| id.clone())
+            .expect("No fulfillment found for disputed contract");
 
-        if let Some(fid) = fulfillment_id {
-            self.execute_settlement(fid, contract, deductions);
-        }
+        // Determine which party bears the dispute mark based on who the arbitrator ruled against
+        let (dispute_loser, final_status, event_type) = match resolution {
+            DisputeResolution::Buyer => (
+                Some(contract.seller.clone()), // seller failed to perform
+                ContractStatus::ResolvedBuyer,
+                EventType::ContractResolvedBuyer,
+            ),
+            DisputeResolution::Seller => (
+                Some(contract.buyer.clone()), // buyer filed a bad dispute
+                ContractStatus::ResolvedSeller,
+                EventType::ContractResolvedSeller,
+            ),
+        };
+
+        self.execute_settlement(fulfillment_id, contract, deductions, dispute_loser);
+
+        // execute_settlement sets status to Settled; overwrite with the correct resolution status
+        let mut contract = self.contracts.get(&contract_id).cloned().expect("Contract not found");
+        contract.status = final_status;
+        contract.updated_at = now;
+        self.contracts.insert(contract_id.clone(), contract);
 
         self.emit(AuditEvent {
             event_id: make_event_id(&contract_id, &event_type, now),
@@ -788,8 +851,13 @@ impl DTPContract {
     // -----------------------------------------------------------------------
 
     /// Propose a standing agreement. Requires both parties to sign to activate.
+    ///
+    /// The proposer explicitly declares their role in the agreement (`proposer_role`).
+    /// Any registered account can act as buyer or seller regardless of business type —
+    /// role is determined per-agreement, not stamped on the account at registration.
     pub fn propose_standing_agreement(
         &mut self,
+        proposer_role: ProposerRole,
         counterparty: AccountId,
         goods: GoodsSpec,
         period_start: u64,
@@ -806,13 +874,11 @@ impl DTPContract {
         let agreement_id = self.next_id();
         let now = self.now_ms();
 
-        // Proposer signs immediately; counterparty signs via sign_standing_agreement()
-        let (buyer, seller, buyer_signed, seller_signed) =
-            if matches!(self.parties.get(&proposer).unwrap().business_type, BusinessType::Retailer | BusinessType::Cooperative) {
-                (proposer.clone(), counterparty, Some(now), None)
-            } else {
-                (counterparty, proposer.clone(), None, Some(now))
-            };
+        // Proposer signs their side immediately; counterparty signs via sign_standing_agreement()
+        let (buyer, seller, buyer_signed, seller_signed) = match proposer_role {
+            ProposerRole::Buyer  => (proposer.clone(), counterparty, Some(now), None),
+            ProposerRole::Seller => (counterparty, proposer.clone(), None, Some(now)),
+        };
 
         let agreement = StandingAgreement {
             agreement_id: agreement_id.clone(),
@@ -994,10 +1060,11 @@ impl DTPContract {
     // Internal: reputation + relationship updates
     // -----------------------------------------------------------------------
 
-    fn update_reputation(&mut self, account: &AccountId, completed: bool, on_time: bool) {
+    fn update_reputation(&mut self, account: &AccountId, completed: bool, disputed: bool, on_time: bool) {
         if let Some(mut party) = self.parties.get(account).cloned() {
             if completed { party.reputation.trades_completed += 1; }
-            if on_time  { party.reputation.trades_settled_on_time += 1; }
+            if disputed  { party.reputation.trades_disputed += 1; }
+            if on_time   { party.reputation.trades_settled_on_time += 1; }
             party.reputation.last_updated = self.now_ms();
             party.reputation.recompute();
             self.parties.insert(account.clone(), party);
@@ -1032,6 +1099,16 @@ impl DTPContract {
         rel.total_volume += volume;
         rel.last_trade_at = now;
         rel.updated_at = now;
+
+        // Update on-time delivery rate as a running weighted average (basis points)
+        let n = rel.trades_completed as u64;
+        let prev = rel.on_time_delivery_rate_bp as u64;
+        rel.on_time_delivery_rate_bp = if on_time {
+            ((prev * (n - 1) + 10_000) / n) as u32
+        } else {
+            ((prev * (n - 1)) / n) as u32
+        };
+
         rel.tier = RelationshipTier::derive(
             rel.trades_completed,
             rel.total_volume,

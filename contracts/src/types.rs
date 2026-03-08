@@ -22,6 +22,58 @@ pub enum BusinessType {
     Agent,
 }
 
+/// Status of a KYB (Know Your Business) legal identity attestation.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub enum KybStatus {
+    Pending,
+    Verified,
+    Expired,
+    Revoked,
+}
+
+/// Legal entity identity attestation attached to a DTP Account.
+///
+/// KybRef bridges the cryptographic identity (NEAR account) and the legal
+/// identity of the business or individual behind it. In v1, parties
+/// self-report and reference an external KYB provider. Future versions
+/// will allow providers to write attestations directly to the party record.
+///
+/// This field is optional at registration and never required for trading,
+/// but platforms and counterparties may filter or weight by KYB status.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct KybRef {
+    /// Legal entity name as registered (may differ from business_name display name)
+    pub legal_name: String,
+    /// Tax identifier (EIN for US entities, VAT for EU, etc.)
+    pub tax_id: Option<String>,
+    /// Jurisdiction of registration (ISO 3166-1 alpha-2 country code)
+    pub jurisdiction: String,
+    /// KYB attestation provider (e.g. "stripe_identity", "persona", "manual")
+    pub provider: String,
+    /// Provider's attestation reference ID or verification URL
+    pub attestation_ref: Option<String>,
+    /// When this attestation was issued (Unix ms)
+    pub issued_at: u64,
+    /// When this attestation expires; None means no expiry
+    pub expires_at: Option<u64>,
+    pub status: KybStatus,
+}
+
+/// The role the proposer is taking in a StandingAgreement.
+/// Any registered account can propose as either buyer or seller —
+/// business type does not constrain trade role.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub enum ProposerRole {
+    Buyer,
+    Seller,
+}
+
 #[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
 #[borsh(crate = "near_sdk::borsh")]
 #[serde(crate = "near_sdk::serde")]
@@ -92,6 +144,10 @@ pub struct Party {
     pub business_name: String,
     pub business_type: BusinessType,
     pub jurisdiction: String,
+    /// Optional legal entity identity attestation (KYB).
+    /// Bridges the NEAR account (cryptographic identity) to a real-world
+    /// business or individual. Not required for trading in v1.
+    pub kyb: Option<KybRef>,
     pub certifications: Vec<CertificationRef>,
     pub reputation: ReputationRecord,
     pub created_at: u64,
@@ -597,8 +653,8 @@ pub enum RelationshipTier {
 }
 
 impl RelationshipTier {
-    pub fn derive(trades: u32, volume_usd_cents: u128, has_standing_agreement: bool) -> Self {
-        let volume_usd = volume_usd_cents / 100;
+    pub fn derive(trades: u32, volume_microdollars: u128, has_standing_agreement: bool) -> Self {
+        let volume_usd = volume_microdollars / 1_000_000;
         if has_standing_agreement && volume_usd >= 250_000 {
             return RelationshipTier::Strategic;
         }
