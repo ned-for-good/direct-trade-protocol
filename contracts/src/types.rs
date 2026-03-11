@@ -231,6 +231,14 @@ pub struct Party {
     /// Distinct from product-level allergens on GoodsCatalogEntry.
     /// Buyers use this to assess shared-equipment allergen risk before sourcing.
     pub facility_allergens: Vec<Allergen>,
+
+    /// URI of the party's DTP data vault — a secure, encrypted storage service
+    /// accessible via NEAR signature challenge. When set, apps with appropriate
+    /// permission scopes can request access to structured off-chain business data
+    /// (ERP, CRM, financial records, etc.) using "Login with DTP" OAuth-style flow.
+    /// None = vault not yet configured. This field is the on-chain anchor for Phase 3
+    /// of the DTP roadmap; the vault service itself is not part of v1.
+    pub data_vault_uri: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

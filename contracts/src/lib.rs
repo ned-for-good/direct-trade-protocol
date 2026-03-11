@@ -187,6 +187,7 @@ impl DTPContract {
             duns_number: None,
             fsma_pcqi_on_file: false,
             facility_allergens: vec![],
+            data_vault_uri: None,
         };
         self.parties.insert(account.clone(), party.clone());
         near_sdk::log!("Party registered: {}", account);
@@ -218,6 +219,7 @@ impl DTPContract {
         duns_number: Option<String>,
         fsma_pcqi_on_file: Option<bool>,
         facility_allergens: Option<Vec<Allergen>>,
+        data_vault_uri: Option<String>,
     ) {
         let account = env::predecessor_account_id();
         let mut party = self.parties.get(&account).cloned().expect("Party not registered");
@@ -237,6 +239,9 @@ impl DTPContract {
         }
         if let Some(allergens) = facility_allergens {
             party.facility_allergens = allergens;
+        }
+        if let Some(uri) = data_vault_uri {
+            party.data_vault_uri = Some(uri);
         }
 
         self.parties.insert(account.clone(), party.clone());
@@ -2323,6 +2328,7 @@ mod tests {
             duns_number: None,
             fsma_pcqi_on_file: false,
             facility_allergens: vec![],
+            data_vault_uri: None,
         });
         c
     }
