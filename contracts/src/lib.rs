@@ -1436,6 +1436,108 @@ impl DTPContract {
         self.write_cte(cte);
     }
 
+    /// Record a Growing CTE: the caller (a farm or grower) attests to harvesting a FTL commodity.
+    ///
+    /// This is the origin event — the first link in the traceability chain. It must be
+    /// recorded by the party that owns the lot at harvest time. `field_gln` is the GS1 GLN
+    /// of the specific field or growing location; if not yet assigned, the actor's facility
+    /// GLN is used as fallback. `harvest_date_ms` is the actual physical harvest date and
+    /// may differ from the block timestamp.
+    pub fn record_cte_growing(
+        &mut self,
+        lot_id: String,
+        commodity: String,
+        variety: Option<String>,
+        harvest_date_ms: u64,
+        field_gln: Option<String>,
+        quantity_milliamount: u64,
+        unit: String,
+        notes: Option<String>,
+    ) {
+        let actor = env::predecessor_account_id();
+        let lot = self.lots.get(&lot_id).cloned().expect("Lot not found");
+        self.require_party_or_agent(&lot.owner);
+        assert!(!commodity.trim().is_empty(), "commodity must not be empty");
+
+        let cte_id = self.next_id_for("cte-");
+        let now = self.now_ms();
+
+        let party = self.parties.get(&actor).cloned().expect("Party not registered");
+        // Use the supplied field GLN if provided, otherwise fall back to party's facility GLN
+        let actor_gln = field_gln.or_else(|| party.gs1_gln.clone());
+
+        let cte = Fsma204Cte {
+            cte_id,
+            cte_type: Fsma204EventType::Growing,
+            lot_id,
+            output_lot_id: None,
+            actor: actor.clone(),
+            actor_gln,
+            source_gln: None,
+            dest_gln: None,
+            quantity_milliamount,
+            unit,
+            commodity: Some(commodity),
+            variety,
+            event_date_ms: harvest_date_ms,
+            recorded_at: now,
+            notes,
+        };
+
+        self.write_cte(cte);
+    }
+
+    /// Record a Creating CTE: the first packer assigns a Traceability Lot Code (TLC) and
+    /// records the initial pack event.
+    ///
+    /// "Creating" is the moment a TLC is born — when a packer takes raw harvested product
+    /// and packs it into a case or container, assigning the identifier the lot will carry
+    /// for the rest of its journey. This must be called by the lot owner (the first packer).
+    /// `pack_date_ms` is the actual physical pack date; `packing_facility_gln` is the GS1 GLN
+    /// of the packing facility.
+    pub fn record_cte_creating(
+        &mut self,
+        lot_id: String,
+        commodity: String,
+        variety: Option<String>,
+        pack_date_ms: u64,
+        packing_facility_gln: Option<String>,
+        quantity_milliamount: u64,
+        unit: String,
+        notes: Option<String>,
+    ) {
+        let actor = env::predecessor_account_id();
+        let lot = self.lots.get(&lot_id).cloned().expect("Lot not found");
+        self.require_party_or_agent(&lot.owner);
+        assert!(!commodity.trim().is_empty(), "commodity must not be empty");
+
+        let cte_id = self.next_id_for("cte-");
+        let now = self.now_ms();
+
+        let party = self.parties.get(&actor).cloned().expect("Party not registered");
+        let actor_gln = packing_facility_gln.or_else(|| party.gs1_gln.clone());
+
+        let cte = Fsma204Cte {
+            cte_id,
+            cte_type: Fsma204EventType::Creating,
+            lot_id,
+            output_lot_id: None,
+            actor: actor.clone(),
+            actor_gln,
+            source_gln: None,
+            dest_gln: None,
+            quantity_milliamount,
+            unit,
+            commodity: Some(commodity),
+            variety,
+            event_date_ms: pack_date_ms,
+            recorded_at: now,
+            notes,
+        };
+
+        self.write_cte(cte);
+    }
+
     /// Transform one or more input lots into a new output lot, recording a Transforming CTE.
     ///
     /// Each `InputLotRef` specifies how much milliamount is consumed from an existing lot.
@@ -2503,5 +2605,269 @@ mod tests {
         assert_eq!(results.len(), 1, "Only one intent should be eligible");
         assert_eq!(results[0].intent_id, _good_id);
         assert!(results[0].score > 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // FSMA 204 CTE tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cte_growing_records_and_indexes_under_lot() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        c.record_cte_growing(
+            lot_id.clone(),
+            "blueberries".to_string(),
+            Some("Duke".to_string()),
+            1_000,   // harvest_date_ms
+            Some("0614141000005".to_string()), // field GLN
+            500_000, // 500 lb
+            "lb".to_string(),
+            None,
+        );
+
+        let ctes = c.get_lot_ctes(lot_id.clone());
+        assert_eq!(ctes.len(), 1);
+        assert_eq!(ctes[0].cte_type, Fsma204EventType::Growing);
+        assert_eq!(ctes[0].commodity, Some("blueberries".to_string()));
+        assert_eq!(ctes[0].variety, Some("Duke".to_string()));
+        assert_eq!(ctes[0].actor_gln, Some("0614141000005".to_string()));
+        assert!(ctes[0].cte_id.starts_with("cte-"));
+    }
+
+    #[test]
+    fn cte_growing_falls_back_to_party_gln_when_field_gln_absent() {
+        let mut c = setup_with_party();
+        // Give the party a GLN
+        c.parties.get_mut(&owner()).map(|p| p.gs1_gln = Some("1234567890123".to_string()));
+
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        c.record_cte_growing(
+            lot_id.clone(),
+            "tomatoes".to_string(),
+            None,
+            1_000,
+            None, // no field GLN supplied
+            100_000,
+            "lb".to_string(),
+            None,
+        );
+
+        let ctes = c.get_lot_ctes(lot_id);
+        assert_eq!(ctes[0].actor_gln, Some("1234567890123".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "commodity must not be empty")]
+    fn cte_growing_rejects_empty_commodity() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+        c.record_cte_growing(lot_id, "".to_string(), None, 1_000, None, 100_000, "lb".to_string(), None);
+    }
+
+    #[test]
+    fn cte_creating_records_and_indexes_under_lot() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        c.record_cte_creating(
+            lot_id.clone(),
+            "blueberries".to_string(),
+            Some("Duke".to_string()),
+            2_000,   // pack_date_ms
+            Some("0614141000012".to_string()), // packing facility GLN
+            500_000,
+            "lb".to_string(),
+            Some("First pack of season".to_string()),
+        );
+
+        let ctes = c.get_lot_ctes(lot_id);
+        assert_eq!(ctes.len(), 1);
+        assert_eq!(ctes[0].cte_type, Fsma204EventType::Creating);
+        assert_eq!(ctes[0].commodity, Some("blueberries".to_string()));
+        assert_eq!(ctes[0].actor_gln, Some("0614141000012".to_string()));
+        assert_eq!(ctes[0].notes, Some("First pack of season".to_string()));
+    }
+
+    #[test]
+    fn cte_receiving_records_source_gln() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        c.record_cte_receiving(
+            lot_id.clone(),
+            Some("9876543210987".to_string()), // source GLN (shipper's location)
+            500_000,
+            "lb".to_string(),
+            3_000,
+            None,
+        );
+
+        let ctes = c.get_lot_ctes(lot_id);
+        assert_eq!(ctes.len(), 1);
+        assert_eq!(ctes[0].cte_type, Fsma204EventType::Receiving);
+        assert_eq!(ctes[0].source_gln, Some("9876543210987".to_string()));
+        assert_eq!(ctes[0].dest_gln, None);
+    }
+
+    #[test]
+    fn cte_shipping_records_dest_gln() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        c.record_cte_shipping(
+            lot_id.clone(),
+            Some("1111111111111".to_string()), // destination GLN
+            500_000,
+            "lb".to_string(),
+            4_000,
+            None,
+        );
+
+        let ctes = c.get_lot_ctes(lot_id);
+        assert_eq!(ctes.len(), 1);
+        assert_eq!(ctes[0].cte_type, Fsma204EventType::Shipping);
+        assert_eq!(ctes[0].dest_gln, Some("1111111111111".to_string()));
+        assert_eq!(ctes[0].source_gln, None);
+    }
+
+    #[test]
+    fn multiple_ctes_on_same_lot_all_indexed() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        // Farm records Growing, then Creating, then ships
+        c.record_cte_growing(lot_id.clone(), "blueberries".to_string(), None, 1_000, None, 500_000, "lb".to_string(), None);
+        c.record_cte_creating(lot_id.clone(), "blueberries".to_string(), None, 2_000, None, 500_000, "lb".to_string(), None);
+        c.record_cte_shipping(lot_id.clone(), None, 500_000, "lb".to_string(), 3_000, None);
+
+        let ctes = c.get_lot_ctes(lot_id);
+        assert_eq!(ctes.len(), 3);
+        // Order matches insertion order
+        assert_eq!(ctes[0].cte_type, Fsma204EventType::Growing);
+        assert_eq!(ctes[1].cte_type, Fsma204EventType::Creating);
+        assert_eq!(ctes[2].cte_type, Fsma204EventType::Shipping);
+    }
+
+    #[test]
+    fn transform_lot_indexes_cte_under_all_input_and_output_lots() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let input_lot_id = c.create_lot(sample_lot(catalog_id.clone()));
+
+        let output_lot_id = c.transform_lot(
+            vec![InputLotRef { lot_id: input_lot_id.clone(), milliamount: 500_000, unit: "lb".to_string() }],
+            catalog_id,
+            400_000,
+            "lb".to_string(),
+            Some("PACK-OUT-001".to_string()),
+            Some("blueberries".to_string()),
+            None,
+            1_000,
+            None,
+        );
+
+        // Input lot should have a Transforming CTE
+        let input_ctes = c.get_lot_ctes(input_lot_id);
+        assert_eq!(input_ctes.len(), 1);
+        assert_eq!(input_ctes[0].cte_type, Fsma204EventType::Transforming);
+        assert_eq!(input_ctes[0].output_lot_id, Some(output_lot_id.clone()));
+
+        // Output lot should also have the same Transforming CTE indexed
+        let output_ctes = c.get_lot_ctes(output_lot_id.clone());
+        assert_eq!(output_ctes.len(), 1); // LotCreated and LotTransformed events are audit events, not CTEs
+        assert_eq!(output_ctes[0].cte_id, input_ctes[0].cte_id);
+
+        // Output lot should exist and have the right quantity
+        let out_lot = c.get_lot(output_lot_id).unwrap();
+        assert_eq!(out_lot.total_milliamount, 400_000);
+        assert_eq!(out_lot.input_lots.len(), 1);
+
+        // Input lot should be fully consumed
+        let in_lot = c.get_lot(input_ctes[0].lot_id.clone()).unwrap();
+        assert_eq!(in_lot.available_milliamount, 0);
+        assert_eq!(in_lot.status, LotStatus::FullyAllocated);
+    }
+
+    #[test]
+    fn anchor_coa_attaches_hash_to_lot() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        let doc_hash = "a".repeat(64); // valid 64-char SHA-256 hex
+        c.anchor_coa(
+            lot_id.clone(),
+            "COA".to_string(),
+            "Eurofins Scientific".to_string(),
+            doc_hash.clone(),
+            Some(9_999_999),
+        );
+
+        let lot = c.get_lot(lot_id).unwrap();
+        assert_eq!(lot.lot_certifications.len(), 1);
+        assert_eq!(lot.lot_certifications[0].cert_type, "COA");
+        assert_eq!(lot.lot_certifications[0].issuer, "Eurofins Scientific");
+        assert_eq!(lot.lot_certifications[0].doc_hash, Some(doc_hash));
+        assert_eq!(lot.lot_certifications[0].expires_at, Some(9_999_999));
+        assert_eq!(lot.lot_certifications[0].status, CertStatus::Active);
+    }
+
+    #[test]
+    #[should_panic(expected = "doc_hash must be a 64-char SHA-256")]
+    fn anchor_coa_rejects_invalid_hash() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+        c.anchor_coa(lot_id, "COA".to_string(), "Lab".to_string(), "tooshort".to_string(), None);
+    }
+
+    #[test]
+    fn update_party_identity_sets_gln_and_duns() {
+        let mut c = setup_with_party();
+        c.update_party_identity(
+            Some("0614141000005".to_string()),
+            Some("123456789".to_string()),
+            Some(true),
+            Some(vec![Allergen::TreeNuts, Allergen::Peanuts]),
+            Some("https://vault.example.com/acme".to_string()),
+        );
+
+        let party = c.get_party(owner()).unwrap();
+        assert_eq!(party.gs1_gln, Some("0614141000005".to_string()));
+        assert_eq!(party.duns_number, Some("123456789".to_string()));
+        assert!(party.fsma_pcqi_on_file);
+        assert_eq!(party.facility_allergens.len(), 2);
+        assert_eq!(party.data_vault_uri, Some("https://vault.example.com/acme".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "GS1 GLN must be exactly 13 digits")]
+    fn update_party_identity_rejects_short_gln() {
+        let mut c = setup_with_party();
+        c.update_party_identity(
+            Some("123456".to_string()), // too short
+            None, None, None, None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "D-U-N-S number must be exactly 9 digits")]
+    fn update_party_identity_rejects_short_duns() {
+        let mut c = setup_with_party();
+        c.update_party_identity(
+            None,
+            Some("12345".to_string()), // too short
+            None, None, None,
+        );
     }
 }
