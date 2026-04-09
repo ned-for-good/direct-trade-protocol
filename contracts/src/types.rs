@@ -22,6 +22,117 @@ pub enum BusinessType {
     Agent,
 }
 
+/// Status of a KYB (Know Your Business) legal identity attestation.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub enum KybStatus {
+    Pending,
+    Verified,
+    Expired,
+    Revoked,
+}
+
+/// Legal entity identity attestation attached to a DTP Account.
+///
+/// KybRef bridges the cryptographic identity (NEAR account) and the legal
+/// identity of the business or individual behind it. In v1, parties
+/// self-report and reference an external KYB provider. Future versions
+/// will allow providers to write attestations directly to the party record.
+///
+/// This field is optional at registration and never required for trading,
+/// but platforms and counterparties may filter or weight by KYB status.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct KybRef {
+    /// Legal entity name as registered (may differ from business_name display name)
+    pub legal_name: String,
+    /// Tax identifier (EIN for US entities, VAT for EU, etc.)
+    pub tax_id: Option<String>,
+    /// Jurisdiction of registration (ISO 3166-1 alpha-2 country code)
+    pub jurisdiction: String,
+    /// KYB attestation provider (e.g. "stripe_identity", "persona", "manual")
+    pub provider: String,
+    /// Provider's attestation reference ID or verification URL
+    pub attestation_ref: Option<String>,
+    /// When this attestation was issued (Unix ms)
+    pub issued_at: u64,
+    /// When this attestation expires; None means no expiry
+    pub expires_at: Option<u64>,
+    pub status: KybStatus,
+}
+
+// ---------------------------------------------------------------------------
+// FSMA Rule 204 — Critical Tracking Events (CTEs)
+// ---------------------------------------------------------------------------
+
+/// The five Critical Tracking Events defined by FSMA Rule 204.
+/// Every food business handling items on the Food Traceability List (FTL)
+/// must maintain Key Data Elements (KDEs) at each CTE boundary.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub enum Fsma204EventType {
+    /// Farm/grower records the harvest of a FTL commodity.
+    Growing,
+    /// First packer assigns the Traceability Lot Code and records pack details.
+    Creating,
+    /// A receiver records arrival of a lot and its originating TLC source.
+    Receiving,
+    /// A transformer creates a new TLC from one or more input TLCs.
+    Transforming,
+    /// A shipper records departure of a lot and its destination.
+    Shipping,
+}
+
+/// A recorded FSMA 204 Critical Tracking Event — the atomic unit of
+/// food supply chain traceability. Immutable once written.
+///
+/// The `lot_id` field references the DTP Traceability Lot Code (TLC).
+/// For Transforming events, `output_lot_id` holds the new TLC produced.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct Fsma204Cte {
+    pub cte_id: String,
+    pub cte_type: Fsma204EventType,
+    /// The primary lot this CTE applies to (the TLC being tracked)
+    pub lot_id: String,
+    /// For Transforming: the new output lot created
+    pub output_lot_id: Option<String>,
+    /// The DTP account performing this CTE (packer, receiver, shipper, etc.)
+    pub actor: AccountId,
+    /// Actor's GS1 GLN (location where the event occurred)
+    pub actor_gln: Option<String>,
+    /// Source GLN — the previous custodian's location (Receiving and Shipping CTEs)
+    pub source_gln: Option<String>,
+    /// Destination GLN — where the lot is headed (Shipping CTE)
+    pub dest_gln: Option<String>,
+    /// Quantity involved in this CTE (milliamount in the lot's trade unit)
+    pub quantity_milliamount: u64,
+    pub unit: String,
+    /// Commodity and variety (required for Growing/Creating CTEs)
+    pub commodity: Option<String>,
+    pub variety: Option<String>,
+    /// Actual date of the physical event (may differ from block timestamp)
+    pub event_date_ms: u64,
+    /// Block timestamp when this CTE was recorded on-chain
+    pub recorded_at: u64,
+    pub notes: Option<String>,
+}
+
+/// The role the proposer is taking in a StandingAgreement.
+/// Any registered account can propose as either buyer or seller —
+/// business type does not constrain trade role.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub enum ProposerRole {
+    Buyer,
+    Seller,
+}
+
 #[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
 #[borsh(crate = "near_sdk::borsh")]
 #[serde(crate = "near_sdk::serde")]
@@ -92,9 +203,42 @@ pub struct Party {
     pub business_name: String,
     pub business_type: BusinessType,
     pub jurisdiction: String,
+    /// Optional legal entity identity attestation (KYB).
+    /// Bridges the NEAR account (cryptographic identity) to a real-world
+    /// business or individual. Not required for trading in v1.
+    pub kyb: Option<KybRef>,
     pub certifications: Vec<CertificationRef>,
     pub reputation: ReputationRecord,
+    /// Accounts authorized to act on behalf of this party (agents, sub-accounts).
+    /// Owner-only management via authorize_agent / revoke_agent.
+    pub authorized_agents: Vec<AccountId>,
     pub created_at: u64,
+
+    // ── Portable business identity ──────────────────────────────────────────
+    /// GS1 Global Location Number (13-digit) — the universal location identifier
+    /// required by major food retailers and embedded in FSMA 204 CTE records.
+    /// Format: XXXXXXXXXXXXXXXXX (13 digits). None = not yet assigned.
+    pub gs1_gln: Option<String>,
+    /// Dun & Bradstreet D-U-N-S Number (9-digit) — universal business identifier
+    /// used by banks, insurers, and enterprise procurement systems for credit
+    /// and vendor qualification. Format: XXXXXXXXX. None = not yet assigned.
+    pub duns_number: Option<String>,
+    /// True when a Preventive Controls Qualified Individual (PCQI) attestation
+    /// is on file with DTP. Required under 21 CFR Part 117 for food
+    /// manufacturers and processors who must have a FSMA food safety plan.
+    pub fsma_pcqi_on_file: bool,
+    /// Allergens present in or processed at this facility (cross-contact risk).
+    /// Distinct from product-level allergens on GoodsCatalogEntry.
+    /// Buyers use this to assess shared-equipment allergen risk before sourcing.
+    pub facility_allergens: Vec<Allergen>,
+
+    /// URI of the party's DTP data vault — a secure, encrypted storage service
+    /// accessible via NEAR signature challenge. When set, apps with appropriate
+    /// permission scopes can request access to structured off-chain business data
+    /// (ERP, CRM, financial records, etc.) using "Login with DTP" OAuth-style flow.
+    /// None = vault not yet configured. This field is the on-chain anchor for Phase 3
+    /// of the DTP roadmap; the vault service itself is not part of v1.
+    pub data_vault_uri: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +332,365 @@ pub struct PackStructure {
     pub pallets_per_truckload: Option<u32>,
     pub moq: Quantity,
     pub moq_label: String,
+}
+
+// ---------------------------------------------------------------------------
+// Goods Catalog + Lots
+// ---------------------------------------------------------------------------
+
+/// Product preparation / form factor. The `Other` variant handles commodity-
+/// specific forms not covered by the canonical list.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub enum Preparation {
+    Fresh,
+    Frozen,
+    /// Individually Quick Frozen
+    IQF,
+    Dried,
+    Concentrate,
+    Puree,
+    Juice,
+    Smoked,
+    Fermented,
+    Canned,
+    RoastedOrToasted,
+    Other(String),
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub enum StorageCondition {
+    Ambient,
+    Refrigerated,
+    Frozen,
+    ControlledAtmosphere,
+}
+
+/// FDA FALCPA major food allergens plus sesame (FASTER Act 2023).
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub enum Allergen {
+    Milk,
+    Eggs,
+    Fish,
+    Shellfish,
+    TreeNuts,
+    Peanuts,
+    Wheat,
+    Soybeans,
+    Sesame,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub enum PalletType {
+    GMA,   // 48"×40" GMA pallet (US standard)
+    Euro,  // 1200mm×800mm EUR pallet
+    Custom,
+}
+
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub enum MediaKind {
+    ProductImage,
+    SpecSheet,
+    LabReport,
+    CertDocument,
+    Other(String),
+}
+
+/// Lifecycle status of a GoodsLot.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub enum LotStatus {
+    /// All quantity available for contracting
+    Available,
+    /// Some quantity reserved under active contracts; remainder still available
+    PartiallyAllocated,
+    /// All quantity reserved; no more allocations possible
+    FullyAllocated,
+    /// Goods delivered and attested on-chain; ownership transferred to buyer
+    Fulfilled,
+    /// Lot has been fully transferred to a new owner (resale complete)
+    Transferred,
+    Spoiled,
+    Donated,
+    Recalled,
+}
+
+/// Extensible key-value attribute for commodity-specific fields.
+/// Examples: `{key: "brix", value: "14-16"}`, `{key: "scoville", value: "50000"}`
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct ProductAttribute {
+    pub key: String,
+    pub value: String,
+}
+
+/// Off-chain media reference. The hash (SHA-256 or IPFS CID) is stored on-chain
+/// for tamper-evidence; the actual file is stored off-chain.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct MediaRef {
+    pub kind: MediaKind,
+    /// SHA-256 hex hash or IPFS CIDv1 of the content
+    pub hash: String,
+    /// Optional retrieval hint (IPFS gateway, S3 presigned URL). Not authoritative.
+    pub uri_hint: Option<String>,
+}
+
+/// Physical dimensions in millimetres.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct Dimensions {
+    pub length_mm: u32,
+    pub width_mm: u32,
+    pub height_mm: u32,
+}
+
+/// Each/unit-level physical spec.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct EachSpec {
+    pub net_weight_g: Option<u32>,
+    pub gross_weight_g: Option<u32>,
+    pub dimensions_mm: Option<Dimensions>,
+    /// 12-digit UPC-A barcode
+    pub upc: Option<String>,
+}
+
+/// Case-level physical spec. The standard B2B order unit.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct CaseSpec {
+    /// Number of eaches per case (e.g. 12 bottles per case)
+    pub units_per_case: u32,
+    /// Total net weight of case contents in grams
+    pub net_weight_g: u32,
+    pub gross_weight_g: u32,
+    pub dimensions_mm: Dimensions,
+    /// Case-level GTIN-14 (may differ from each GTIN)
+    pub gtin: Option<String>,
+}
+
+/// Pallet-level spec for freight planning.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct PalletSpec {
+    pub cases_per_layer: u32,
+    pub layers: u32,
+    /// Total cases per pallet = cases_per_layer * layers
+    pub cases_per_pallet: u32,
+    pub gross_weight_kg: u32,
+    pub dimensions_mm: Dimensions,
+    pub pallet_type: PalletType,
+}
+
+/// Full pack hierarchy for a catalog entry.
+/// `trade_unit` is the unit in which prices are quoted and quantities traded
+/// (e.g. "lb", "oz", "kg", "gal", "L", "ea").
+/// The case and pallet specs provide freight-planning geometry.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct PackDefinition {
+    /// Trade/pricing unit: "lb", "oz", "kg", "gal", "L", "ea", etc.
+    pub trade_unit: String,
+    /// Weight of one case in trade units (e.g. Quantity { 30_000, "lb" } = 30 lb/case).
+    /// Used to convert between weight quantities and case counts for freight.
+    pub case_weight: Option<Quantity>,
+    pub each: Option<EachSpec>,
+    pub case: Option<CaseSpec>,
+    pub pallet: Option<PalletSpec>,
+}
+
+/// Lot-level certification (e.g. COA, lab test result, harvest-specific cert).
+/// Distinct from account-level and catalog-level certifications.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct LotCertRef {
+    pub cert_type: String,
+    pub issuer: String,
+    pub issued_at: u64,
+    pub expires_at: Option<u64>,
+    /// SHA-256 of the certificate document (off-chain)
+    pub doc_hash: Option<String>,
+    pub status: CertStatus,
+}
+
+/// An ownership transfer event appended to a GoodsLot's provenance chain.
+/// Every on-chain transfer writes one of these — forming an immutable
+/// traceability record from origin to current holder.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct ProvenanceEvent {
+    pub from: AccountId,
+    pub to: AccountId,
+    /// Quantity transferred in milliamount (same unit as GoodsLot)
+    pub milliamount: u64,
+    pub unit: String,
+    /// The DTP contract that effected this transfer
+    pub contract_id: String,
+    pub timestamp: u64,
+}
+
+/// Reference to an input lot consumed during manufacturing (BOM line item).
+/// Enables FSMA 204 one-up / one-down traceability for processed goods.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct InputLotRef {
+    pub lot_id: String,
+    pub milliamount: u64,
+    pub unit: String,
+}
+
+/// A reusable product master record owned by a DTP account.
+/// Created once per unique product definition; referenced by GoodsLots,
+/// SupplyListings, and TradeIntents.
+///
+/// System-assigned fields (catalog_id, owner, version, created_at, updated_at)
+/// are set by the contract and overwrite any caller-supplied values.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct GoodsCatalogEntry {
+    // ── System-assigned ────────────────────────────────────────────────────
+    pub catalog_id: String,
+    pub owner: AccountId,
+    pub version: u32,
+
+    // ── Identification ─────────────────────────────────────────────────────
+    /// GS1 GTIN-14 (case-level by convention)
+    pub gtin: Option<String>,
+    pub brand: Option<String>,
+    /// Display name: "Organic IQF Duke Blueberries 30lb"
+    pub product_name: String,
+    /// Owner's internal SKU (not globally unique, not published)
+    pub internal_sku: Option<String>,
+    /// Dotted taxonomy: "food.produce.berries.blueberries" or "auto.parts.engine"
+    pub category: String,
+
+    // ── Commodity detail ───────────────────────────────────────────────────
+    pub commodity: Option<String>,
+    pub variety: Option<String>,
+    pub grade: Option<String>,
+    pub growing_region: Option<String>,
+    /// ISO 3166-1 alpha-2 country code
+    pub country_of_origin: Option<String>,
+    pub preparation: Option<Preparation>,
+    pub storage_condition: StorageCondition,
+    pub shelf_life_days: Option<u32>,
+
+    // ── Pack hierarchy ─────────────────────────────────────────────────────
+    pub pack: PackDefinition,
+    /// True when case weight varies by unit (common in meat and whole produce)
+    pub catch_weight: bool,
+
+    // ── Compliance ─────────────────────────────────────────────────────────
+    /// INCI / plain-text ingredient declaration
+    pub ingredients: Option<String>,
+    pub allergens: Vec<Allergen>,
+    /// SHA-256 of nutrition facts JSON (off-chain). None = not applicable.
+    pub nutrition_hash: Option<String>,
+
+    // ── Product-level certifications ───────────────────────────────────────
+    /// e.g. USDA Organic handler cert, Non-GMO Project, Kosher, Halal
+    pub certifications: Vec<CertificationRef>,
+
+    // ── Extensibility ──────────────────────────────────────────────────────
+    pub attributes: Vec<ProductAttribute>,
+
+    // ── Off-chain media (content-addressed) ───────────────────────────────
+    pub media_hashes: Vec<MediaRef>,
+
+    // ── System-assigned timestamps ─────────────────────────────────────────
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+/// A specific, finite quantity of goods on-chain — the atomic unit of trade.
+///
+/// Quantity is tracked in the catalog entry's `trade_unit` (usually weight).
+/// Ownership transfers via the provenance chain on each DTP settlement.
+///
+/// System-assigned fields (lot_id, owner, available_milliamount, provenance,
+/// status, created_at, updated_at) are set by the contract.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct GoodsLot {
+    // ── System-assigned ────────────────────────────────────────────────────
+    pub lot_id: String,
+    pub owner: AccountId,
+    pub available_milliamount: u64,
+    pub provenance: Vec<ProvenanceEvent>,
+    pub status: LotStatus,
+    pub created_at: u64,
+    pub updated_at: u64,
+
+    // ── Caller-provided ────────────────────────────────────────────────────
+    pub catalog_id: String,
+    /// First account to bring this lot on-chain (immutable after creation)
+    pub origin_account: AccountId,
+    /// Total quantity in catalog entry's trade_unit (milliamount)
+    pub total_milliamount: u64,
+    pub unit: String,
+
+    // ── Lot identity ───────────────────────────────────────────────────────
+    /// Farm / manufacturer lot code (FSMA Key Traceability Lot Code)
+    pub lot_number: Option<String>,
+    pub pack_date: Option<u64>,
+    pub harvest_date: Option<u64>,
+    pub best_by: Option<u64>,
+
+    // ── Lot-specific certifications ────────────────────────────────────────
+    pub lot_certifications: Vec<LotCertRef>,
+
+    // ── Manufacturing inputs (FSMA one-up traceability) ────────────────────
+    pub input_lots: Vec<InputLotRef>,
+}
+
+// ---------------------------------------------------------------------------
+// Finance pools
+// ---------------------------------------------------------------------------
+
+/// A registered DeFi liquidity pool that can finance DTP trades.
+///
+/// The pool account is an external NEAR contract that listens for
+/// `FinancingRequested` events and calls `confirm_financing` when funded.
+/// Capital deployed earns yield from finance_fee_bps charged to the buyer.
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[borsh(crate = "near_sdk::borsh")]
+#[serde(crate = "near_sdk::serde")]
+pub struct FinancePool {
+    pub pool_id: String,
+    /// The NEAR account of the pool contract (authorized to confirm financing)
+    pub pool_account: AccountId,
+    /// Maximum rate this pool charges, in basis points (e.g. 150 = 1.5%)
+    pub max_rate_bps: u16,
+    /// Capital available to deploy, in microdollars
+    pub available_microdollars: u128,
+    /// Capital currently deployed (outstanding), in microdollars
+    pub deployed_microdollars: u128,
+    pub active: bool,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +880,9 @@ pub struct TradeIntent {
     pub intent_id: String,
     pub version: String,
     pub buyer: AccountId,
+    /// If set, buyer will accept any lot matching this catalog entry.
+    /// Takes precedence over inline GoodsSpec for matching purposes.
+    pub catalog_id: Option<String>,
     pub goods: GoodsSpec,
     pub delivery: DeliverySpec,
     pub pricing: BuyerPricing,
@@ -411,6 +917,9 @@ pub struct SupplyListing {
     pub listing_id: String,
     pub version: String,
     pub seller: AccountId,
+    /// If set, this listing is backed by a specific on-chain GoodsLot.
+    /// Quantity available is governed by lot.available_milliamount.
+    pub lot_id: Option<String>,
     pub goods: GoodsSpec,
     pub pack_structure: PackStructure,
     pub delivery: DeliverySpec,
@@ -501,6 +1010,9 @@ pub struct TradeContract {
     pub offer_id: String,
     pub buyer: AccountId,
     pub seller: AccountId,
+    /// If the listing referenced a GoodsLot, the contract captures it here.
+    /// Ownership transfers to buyer at settlement.
+    pub lot_id: Option<String>,
     pub goods: GoodsSpec,
     pub delivery: DeliverySpec,
     pub finance: Option<FinanceTerms>,
@@ -597,8 +1109,8 @@ pub enum RelationshipTier {
 }
 
 impl RelationshipTier {
-    pub fn derive(trades: u32, volume_usd_cents: u128, has_standing_agreement: bool) -> Self {
-        let volume_usd = volume_usd_cents / 100;
+    pub fn derive(trades: u32, volume_microdollars: u128, has_standing_agreement: bool) -> Self {
+        let volume_usd = volume_microdollars / 1_000_000;
         if has_standing_agreement && volume_usd >= 250_000 {
             return RelationshipTier::Strategic;
         }

@@ -36,6 +36,8 @@ pub struct DTPContract {
     // Core storage
     // -----------------------------------------------------------------------
     pub parties: LookupMap<AccountId, Party>,
+    pub catalogs: IterableMap<String, GoodsCatalogEntry>,
+    pub lots: IterableMap<String, GoodsLot>,
     pub intents: IterableMap<String, TradeIntent>,
     pub listings: IterableMap<String, SupplyListing>,
     pub offers: IterableMap<String, Offer>,
@@ -44,9 +46,20 @@ pub struct DTPContract {
     pub settlements: IterableMap<String, Settlement>,
     pub standing_agreements: IterableMap<String, StandingAgreement>,
     pub relationships: LookupMap<String, RelationshipRecord>,
+    pub finance_pools: LookupMap<String, FinancePool>,
+
+    // -----------------------------------------------------------------------
+    // FSMA Rule 204 traceability
+    // -----------------------------------------------------------------------
+    /// All FSMA 204 Critical Tracking Events, keyed by cte_id.
+    pub fsma_ctes: IterableMap<String, Fsma204Cte>,
+    /// Index: lot_id → Vec<cte_id> for efficient lot CTE lookups.
+    pub lot_cte_index: LookupMap<String, Vec<String>>,
 
     /// Append-only audit trail
     pub audit_log: Vector<AuditEvent>,
+    /// Maps entity_id → list of audit_log indices for O(1) entity filtering
+    pub audit_index: LookupMap<String, Vec<u32>>,
 
     /// Counter for generating sequential IDs
     pub id_counter: u64,
@@ -66,6 +79,8 @@ impl DTPContract {
             protocol_version: "0.1".to_string(),
             default_dispute_window_hours: 48,
             parties: LookupMap::new(b"p"),
+            catalogs: IterableMap::new(b"g"),
+            lots: IterableMap::new(b"h"),
             intents: IterableMap::new(b"i"),
             listings: IterableMap::new(b"l"),
             offers: IterableMap::new(b"o"),
@@ -74,7 +89,11 @@ impl DTPContract {
             settlements: IterableMap::new(b"s"),
             standing_agreements: IterableMap::new(b"a"),
             relationships: LookupMap::new(b"r"),
+            finance_pools: LookupMap::new(b"n"),
+            fsma_ctes: IterableMap::new(b"t"),
+            lot_cte_index: LookupMap::new(b"k"),
             audit_log: Vector::new(b"e"),
+            audit_index: LookupMap::new(b"x"),
             id_counter: 0,
         }
     }
@@ -83,9 +102,9 @@ impl DTPContract {
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    fn next_id(&mut self) -> String {
+    fn next_id_for(&mut self, prefix: &str) -> String {
         self.id_counter += 1;
-        format!("dtp-{}", self.id_counter)
+        format!("{}{}", prefix, self.id_counter)
     }
 
     fn now_ms(&self) -> u64 {
@@ -93,8 +112,13 @@ impl DTPContract {
     }
 
     fn emit(&mut self, event: AuditEvent) {
+        let idx = self.audit_log.len();
+        let entity_id = event.entity_id.clone();
         let json = serde_json::to_string(&event).unwrap_or_default();
         self.audit_log.push(event);
+        let mut indices = self.audit_index.get(&entity_id).cloned().unwrap_or_default();
+        indices.push(idx);
+        self.audit_index.insert(entity_id, indices);
         near_sdk::log!("DTP_EVENT:{}", json);
     }
 
@@ -102,8 +126,15 @@ impl DTPContract {
         assert!(self.parties.contains_key(account), "Party not registered");
     }
 
-    fn require_owner(&self) {
-        assert_eq!(env::predecessor_account_id(), self.owner, "Owner only");
+    /// Assert that the caller is the owner account or one of its authorized agents.
+    fn require_party_or_agent(&self, owner: &AccountId) {
+        let caller = env::predecessor_account_id();
+        if caller == *owner { return; }
+        let party = self.parties.get(owner).expect("Party not registered");
+        assert!(
+            party.authorized_agents.contains(&caller),
+            "Caller is not the owner or an authorized agent"
+        );
     }
 
     fn validate_finance_terms(&self, finance: &Option<FinanceTerms>) {
@@ -147,9 +178,16 @@ impl DTPContract {
             business_name,
             business_type,
             jurisdiction,
+            kyb: None,
             certifications: vec![],
             reputation: ReputationRecord::default(),
+            authorized_agents: vec![],
             created_at: self.now_ms(),
+            gs1_gln: None,
+            duns_number: None,
+            fsma_pcqi_on_file: false,
+            facility_allergens: vec![],
+            data_vault_uri: None,
         };
         self.parties.insert(account.clone(), party.clone());
         near_sdk::log!("Party registered: {}", account);
@@ -161,6 +199,90 @@ impl DTPContract {
         let mut party = self.parties.get(&account).cloned().expect("Party not registered");
         party.certifications.push(cert);
         self.parties.insert(account.clone(), party.clone());
+    }
+
+    /// Attach or replace a KYB (legal entity identity) attestation on the caller's account.
+    /// Each account holds at most one KybRef. Calling this again replaces the previous one.
+    pub fn add_kyb_attestation(&mut self, kyb: KybRef) {
+        let account = env::predecessor_account_id();
+        let mut party = self.parties.get(&account).cloned().expect("Party not registered");
+        party.kyb = Some(kyb);
+        self.parties.insert(account.clone(), party);
+    }
+
+    /// Update portable business identity fields on the caller's party record.
+    /// Any subset of fields may be updated in a single call; pass None to leave a field unchanged.
+    /// GS1 GLN and D-U-N-S are validated for correct digit length but not externally verified.
+    pub fn update_party_identity(
+        &mut self,
+        gs1_gln: Option<String>,
+        duns_number: Option<String>,
+        fsma_pcqi_on_file: Option<bool>,
+        facility_allergens: Option<Vec<Allergen>>,
+        data_vault_uri: Option<String>,
+    ) {
+        let account = env::predecessor_account_id();
+        let mut party = self.parties.get(&account).cloned().expect("Party not registered");
+
+        if let Some(gln) = gs1_gln {
+            let digits: String = gln.chars().filter(|c| c.is_ascii_digit()).collect();
+            assert_eq!(digits.len(), 13, "GS1 GLN must be exactly 13 digits");
+            party.gs1_gln = Some(digits);
+        }
+        if let Some(duns) = duns_number {
+            let digits: String = duns.chars().filter(|c| c.is_ascii_digit()).collect();
+            assert_eq!(digits.len(), 9, "D-U-N-S number must be exactly 9 digits");
+            party.duns_number = Some(digits);
+        }
+        if let Some(pcqi) = fsma_pcqi_on_file {
+            party.fsma_pcqi_on_file = pcqi;
+        }
+        if let Some(allergens) = facility_allergens {
+            party.facility_allergens = allergens;
+        }
+        if let Some(uri) = data_vault_uri {
+            party.data_vault_uri = Some(uri);
+        }
+
+        self.parties.insert(account.clone(), party.clone());
+
+        let now = self.now_ms();
+        self.emit(AuditEvent {
+            event_id: make_event_id(&account.to_string(), &EventType::PartyIdentityUpdated, now),
+            event_type: EventType::PartyIdentityUpdated,
+            entity_type: EntityType::Party,
+            entity_id: account.to_string(),
+            actor: account.to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&party),
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent authorization
+    // -----------------------------------------------------------------------
+
+    /// Authorize an agent account to act on behalf of the caller's party.
+    /// Agents can post listings, manage catalog entries and lots, and sign
+    /// agreements. The owner key retains all capabilities.
+    pub fn authorize_agent(&mut self, agent: AccountId) {
+        let account = env::predecessor_account_id();
+        let mut party = self.parties.get(&account).cloned().expect("Party not registered");
+        assert_ne!(agent, account, "Cannot authorize self as agent");
+        if !party.authorized_agents.contains(&agent) {
+            party.authorized_agents.push(agent.clone());
+            self.parties.insert(account.clone(), party);
+            near_sdk::log!("Agent authorized: {} for {}", agent, account);
+        }
+    }
+
+    /// Revoke a previously authorized agent.
+    pub fn revoke_agent(&mut self, agent: AccountId) {
+        let account = env::predecessor_account_id();
+        let mut party = self.parties.get(&account).cloned().expect("Party not registered");
+        party.authorized_agents.retain(|a| a != &agent);
+        self.parties.insert(account.clone(), party);
+        near_sdk::log!("Agent revoked: {} from {}", agent, account);
     }
 
     // -----------------------------------------------------------------------
@@ -182,13 +304,14 @@ impl DTPContract {
         self.validate_finance_terms(&finance);
         self.validate_freight_terms(&freight);
 
-        let intent_id = self.next_id();
+        let intent_id = self.next_id_for("int-");
         let now = self.now_ms();
 
         let intent = TradeIntent {
             intent_id: intent_id.clone(),
             version: self.protocol_version.clone(),
             buyer: buyer.clone(),
+            catalog_id: None,
             goods,
             delivery,
             pricing,
@@ -243,8 +366,11 @@ impl DTPContract {
     // -----------------------------------------------------------------------
 
     /// Post a new SupplyListing. Caller must be a registered party.
+    /// If `lot_id` is provided the listing is backed by that specific GoodsLot;
+    /// the lot must be owned by the caller and have available quantity.
     pub fn post_listing(
         &mut self,
+        lot_id: Option<String>,
         goods: GoodsSpec,
         pack_structure: PackStructure,
         delivery: DeliverySpec,
@@ -260,13 +386,24 @@ impl DTPContract {
         self.validate_finance_terms(&finance);
         self.validate_freight_terms(&freight);
 
-        let listing_id = self.next_id();
+        // Validate lot ownership if a lot is being linked
+        if let Some(ref lid) = lot_id {
+            let lot = self.lots.get(lid).cloned().expect("Lot not found");
+            self.require_party_or_agent(&lot.owner);
+            assert!(
+                matches!(lot.status, LotStatus::Available | LotStatus::PartiallyAllocated),
+                "Lot is not available for listing"
+            );
+        }
+
+        let listing_id = self.next_id_for("lst-");
         let now = self.now_ms();
 
         let listing = SupplyListing {
             listing_id: listing_id.clone(),
             version: self.protocol_version.clone(),
             seller: seller.clone(),
+            lot_id,
             goods,
             pack_structure,
             delivery,
@@ -352,7 +489,7 @@ impl DTPContract {
             }
         }
 
-        let offer_id = self.next_id();
+        let offer_id = self.next_id_for("off-");
         let now = self.now_ms();
 
         let offer = Offer {
@@ -431,24 +568,25 @@ impl DTPContract {
             "Offer not available for acceptance"
         );
 
-        // Determine buyer and seller based on offer target type
-        let (buyer, seller, intent_id, listing_id) = match &offer.target_type {
+        // Determine buyer, seller, and optional lot reference based on offer target type
+        let (buyer, seller, intent_id, listing_id, lot_id) = match &offer.target_type {
             OfferTargetType::Intent => {
                 let mut intent = self.intents.get(&offer.target_id).cloned().expect("Intent not found");
                 assert_eq!(intent.buyer, caller, "Only buyer can accept offer on their intent");
                 assert_eq!(intent.status, IntentStatus::Posted, "Intent not open");
                 intent.status = IntentStatus::Contracted;
                 intent.updated_at = self.now_ms();
-        self.intents.insert(intent.intent_id.clone(), intent.clone());
-                (caller.clone(), offer.offerer.clone(), Some(offer.target_id.clone()), None)
+                self.intents.insert(intent.intent_id.clone(), intent.clone());
+                (caller.clone(), offer.offerer.clone(), Some(offer.target_id.clone()), None, None)
             }
             OfferTargetType::Listing => {
                 let mut listing = self.listings.get(&offer.target_id).cloned().expect("Listing not found");
                 assert_eq!(listing.seller, caller, "Only seller can accept offer on their listing");
                 assert_eq!(listing.status, ListingStatus::Active, "Listing not active");
+                let lot_id = listing.lot_id.clone();
                 listing.status = ListingStatus::Contracted;
-        self.listings.insert(listing.listing_id.clone(), listing.clone());
-                (offer.offerer.clone(), caller.clone(), None, Some(offer.target_id.clone()))
+                self.listings.insert(listing.listing_id.clone(), listing.clone());
+                (offer.offerer.clone(), caller.clone(), None, Some(offer.target_id.clone()), lot_id)
             }
         };
 
@@ -478,7 +616,7 @@ impl DTPContract {
         offer.status = OfferStatus::Accepted;
         self.offers.insert(offer_id.clone(), offer.clone());
 
-        let contract_id = self.next_id();
+        let contract_id = self.next_id_for("ctr-");
         let now = self.now_ms();
 
         // TODO: Replace this placeholder with actual NEP-141 USDC escrow lock.
@@ -488,6 +626,12 @@ impl DTPContract {
         //   3. Funds held until fulfillment or dispute resolution
         let escrow_ref = format!("escrow-placeholder-{}", contract_id);
 
+        // If this contract is backed by a lot, allocate the contracted quantity
+        if let Some(ref lid) = lot_id {
+            let contracted_milliamount = offer.goods.quantity.milliamount;
+            self.allocate_lot(lid, contracted_milliamount);
+        }
+
         let contract = TradeContract {
             contract_id: contract_id.clone(),
             version: self.protocol_version.clone(),
@@ -496,6 +640,7 @@ impl DTPContract {
             offer_id: offer_id.clone(),
             buyer: buyer.clone(),
             seller: seller.clone(),
+            lot_id,
             goods: offer.goods.clone(),
             delivery: offer.delivery.clone(),
             finance: offer.finance.clone(),
@@ -533,6 +678,22 @@ impl DTPContract {
             payload_hash: hash_payload(&contract.escrow_ref),
         });
 
+        // If LP pool financing is requested, emit an event so the pool contract
+        // can listen and call confirm_financing when capital is ready.
+        if let Some(ref finance) = contract.finance {
+            if matches!(finance.financing_mode, FinancingMode::LpPool) {
+                self.emit(AuditEvent {
+                    event_id: make_event_id(&contract_id, &EventType::FinancingRequested, now),
+                    event_type: EventType::FinancingRequested,
+                    entity_type: EntityType::Contract,
+                    entity_id: contract_id.clone(),
+                    actor: caller.to_string(),
+                    timestamp: now,
+                    payload_hash: hash_payload(&finance.liquidity_pool_id),
+                });
+            }
+        }
+
         contract_id
     }
 
@@ -555,8 +716,14 @@ impl DTPContract {
             "Contract not in deliverable state"
         );
 
+        // Guard against duplicate fulfillments for the same contract
+        let already_fulfilled = self.fulfillments
+            .iter()
+            .any(|(_, f)| f.contract_id == contract_id);
+        assert!(!already_fulfilled, "Fulfillment already exists for this contract");
+
         let now = self.now_ms();
-        let fulfillment_id = self.next_id();
+        let fulfillment_id = self.next_id_for("ful-");
 
         let fulfillment = Fulfillment {
             fulfillment_id: fulfillment_id.clone(),
@@ -630,7 +797,7 @@ impl DTPContract {
         });
 
         // Trigger settlement
-        self.execute_settlement(fulfillment_id.clone(), contract, deductions)
+        self.execute_settlement(fulfillment_id.clone(), contract, deductions, None)
     }
 
     fn execute_settlement(
@@ -638,9 +805,10 @@ impl DTPContract {
         fulfillment_id: String,
         mut contract: TradeContract,
         deductions: Vec<Deduction>,
+        dispute_loser: Option<AccountId>,
     ) -> String {
         let now = self.now_ms();
-        let settlement_id = self.next_id();
+        let settlement_id = self.next_id_for("set-");
 
         let total_deductions: Amount = deductions.iter().map(|d| d.amount).sum();
         let net_amount = contract.total_value.saturating_sub(total_deductions);
@@ -663,6 +831,19 @@ impl DTPContract {
 
         self.settlements.insert(settlement_id.clone(), settlement.clone());
 
+        // Transfer lot ownership to buyer if this contract was backed by a lot
+        if let Some(ref lot_id) = contract.lot_id {
+            self.transfer_lot_ownership(
+                lot_id,
+                &contract.seller.clone(),
+                &contract.buyer.clone(),
+                contract.goods.quantity.milliamount,
+                contract.goods.quantity.unit.clone(),
+                &contract.contract_id.clone(),
+                now,
+            );
+        }
+
         contract.status = ContractStatus::Settled;
         contract.updated_at = now;
         self.contracts.insert(contract.contract_id.clone(), contract.clone());
@@ -670,9 +851,11 @@ impl DTPContract {
         // Update relationship record
         self.update_relationship(&contract.buyer.clone(), &contract.seller.clone(), net_amount, true, now);
 
-        // Update reputation records
-        self.update_reputation(&contract.buyer, true, true);
-        self.update_reputation(&contract.seller, true, true);
+        // Update reputation records; if a dispute was resolved, the losing party is marked disputed
+        let buyer_disputed = dispute_loser.as_ref() == Some(&contract.buyer);
+        let seller_disputed = dispute_loser.as_ref() == Some(&contract.seller);
+        self.update_reputation(&contract.buyer, true, buyer_disputed, !buyer_disputed);
+        self.update_reputation(&contract.seller, true, seller_disputed, !seller_disputed);
 
         self.emit(AuditEvent {
             event_id: make_event_id(&settlement_id, &EventType::SettlementCreated, now),
@@ -718,6 +901,13 @@ impl DTPContract {
 
         let now = self.now_ms();
 
+        // Enforce dispute window: buyer must dispute within dispute_window_hours of seller attestation
+        let window_ms = contract.dispute_window_hours as u64 * 3_600_000;
+        assert!(
+            now <= fulfillment.seller_attestation.signed_at + window_ms,
+            "Dispute window has closed; use trigger_auto_settlement instead"
+        );
+
         fulfillment.status = FulfillmentStatus::Disputed;
         self.fulfillments.insert(fulfillment_id.clone(), fulfillment.clone());
 
@@ -734,6 +924,30 @@ impl DTPContract {
             timestamp: now,
             payload_hash: hash_payload(&reason),
         });
+    }
+
+    /// Trigger automatic settlement once the dispute window has elapsed without a buyer response.
+    /// Anyone may call this; the contract enforces that the window has actually passed.
+    pub fn trigger_auto_settlement(&mut self, fulfillment_id: String) -> String {
+        let fulfillment = self.fulfillments.get(&fulfillment_id).cloned()
+            .expect("Fulfillment not found");
+        let contract = self.contracts.get(&fulfillment.contract_id).cloned()
+            .expect("Contract not found");
+
+        assert_eq!(
+            fulfillment.status,
+            FulfillmentStatus::SellerAttested,
+            "Fulfillment not awaiting buyer attestation"
+        );
+
+        let now = self.now_ms();
+        let window_ms = contract.dispute_window_hours as u64 * 3_600_000;
+        assert!(
+            now > fulfillment.seller_attestation.signed_at + window_ms,
+            "Dispute window has not elapsed yet"
+        );
+
+        self.execute_settlement(fulfillment_id, contract, vec![], None)
     }
 
     /// Arbitrator resolves a dispute in favour of buyer or seller.
@@ -756,21 +970,34 @@ impl DTPContract {
 
         let now = self.now_ms();
 
-        let event_type = match resolution {
-            DisputeResolution::Buyer => EventType::ContractResolvedBuyer,
-            DisputeResolution::Seller => EventType::ContractResolvedSeller,
-        };
-
-        // Find the fulfillment for this contract
-        // In v0 we do a linear scan (acceptable for pilot scale)
+        // Find the fulfillment for this contract (linear scan, acceptable for pilot scale)
         let fulfillment_id = self.fulfillments
             .iter()
             .find(|(_, f)| f.contract_id == contract_id)
-            .map(|(id, _)| id.clone());
+            .map(|(id, _)| id.clone())
+            .expect("No fulfillment found for disputed contract");
 
-        if let Some(fid) = fulfillment_id {
-            self.execute_settlement(fid, contract, deductions);
-        }
+        // Determine which party bears the dispute mark based on who the arbitrator ruled against
+        let (dispute_loser, final_status, event_type) = match resolution {
+            DisputeResolution::Buyer => (
+                Some(contract.seller.clone()), // seller failed to perform
+                ContractStatus::ResolvedBuyer,
+                EventType::ContractResolvedBuyer,
+            ),
+            DisputeResolution::Seller => (
+                Some(contract.buyer.clone()), // buyer filed a bad dispute
+                ContractStatus::ResolvedSeller,
+                EventType::ContractResolvedSeller,
+            ),
+        };
+
+        self.execute_settlement(fulfillment_id, contract, deductions, dispute_loser);
+
+        // execute_settlement sets status to Settled; overwrite with the correct resolution status
+        let mut contract = self.contracts.get(&contract_id).cloned().expect("Contract not found");
+        contract.status = final_status;
+        contract.updated_at = now;
+        self.contracts.insert(contract_id.clone(), contract);
 
         self.emit(AuditEvent {
             event_id: make_event_id(&contract_id, &event_type, now),
@@ -788,8 +1015,13 @@ impl DTPContract {
     // -----------------------------------------------------------------------
 
     /// Propose a standing agreement. Requires both parties to sign to activate.
+    ///
+    /// The proposer explicitly declares their role in the agreement (`proposer_role`).
+    /// Any registered account can act as buyer or seller regardless of business type —
+    /// role is determined per-agreement, not stamped on the account at registration.
     pub fn propose_standing_agreement(
         &mut self,
+        proposer_role: ProposerRole,
         counterparty: AccountId,
         goods: GoodsSpec,
         period_start: u64,
@@ -803,16 +1035,14 @@ impl DTPContract {
         self.require_party(&proposer);
         self.require_party(&counterparty);
 
-        let agreement_id = self.next_id();
+        let agreement_id = self.next_id_for("agr-");
         let now = self.now_ms();
 
-        // Proposer signs immediately; counterparty signs via sign_standing_agreement()
-        let (buyer, seller, buyer_signed, seller_signed) =
-            if matches!(self.parties.get(&proposer).unwrap().business_type, BusinessType::Retailer | BusinessType::Cooperative) {
-                (proposer.clone(), counterparty, Some(now), None)
-            } else {
-                (counterparty, proposer.clone(), None, Some(now))
-            };
+        // Proposer signs their side immediately; counterparty signs via sign_standing_agreement()
+        let (buyer, seller, buyer_signed, seller_signed) = match proposer_role {
+            ProposerRole::Buyer  => (proposer.clone(), counterparty, Some(now), None),
+            ProposerRole::Seller => (counterparty, proposer.clone(), None, Some(now)),
+        };
 
         let agreement = StandingAgreement {
             agreement_id: agreement_id.clone(),
@@ -897,6 +1127,705 @@ impl DTPContract {
     }
 
     // -----------------------------------------------------------------------
+    // Goods catalog
+    // -----------------------------------------------------------------------
+
+    /// Create a new catalog entry. The caller becomes the owner.
+    /// catalog_id, owner, version, and timestamps are assigned by the contract.
+    pub fn create_catalog_entry(&mut self, entry: GoodsCatalogEntry) -> String {
+        let owner = env::predecessor_account_id();
+        self.require_party(&owner);
+
+        let catalog_id = self.next_id_for("cat-");
+        let now = self.now_ms();
+
+        let mut entry = entry;
+        entry.catalog_id = catalog_id.clone();
+        entry.owner = owner.clone();
+        entry.version = 1;
+        entry.created_at = now;
+        entry.updated_at = now;
+
+        self.catalogs.insert(catalog_id.clone(), entry.clone());
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(&catalog_id, &EventType::CatalogEntryCreated, now),
+            event_type: EventType::CatalogEntryCreated,
+            entity_type: EntityType::Catalog,
+            entity_id: catalog_id.clone(),
+            actor: owner.to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&entry),
+        });
+
+        catalog_id
+    }
+
+    /// Update an existing catalog entry. Caller must be the owner or an authorized agent.
+    /// Bumps version and updated_at; catalog_id and owner are immutable.
+    pub fn update_catalog_entry(&mut self, catalog_id: String, entry: GoodsCatalogEntry) {
+        let mut existing = self.catalogs.get(&catalog_id).cloned().expect("Catalog entry not found");
+        self.require_party_or_agent(&existing.owner);
+
+        let now = self.now_ms();
+        let mut entry = entry;
+        entry.catalog_id = existing.catalog_id.clone();
+        entry.owner = existing.owner.clone();
+        entry.version = existing.version + 1;
+        entry.created_at = existing.created_at;
+        entry.updated_at = now;
+        existing = entry;
+
+        self.catalogs.insert(catalog_id.clone(), existing.clone());
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(&catalog_id, &EventType::CatalogEntryUpdated, now),
+            event_type: EventType::CatalogEntryUpdated,
+            entity_type: EntityType::Catalog,
+            entity_id: catalog_id.clone(),
+            actor: env::predecessor_account_id().to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&existing),
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Goods lots
+    // -----------------------------------------------------------------------
+
+    /// Bring a new goods lot on-chain. Caller must be a registered party.
+    /// lot_id, owner, available_milliamount, provenance, status, and timestamps
+    /// are assigned by the contract; all other fields are caller-provided.
+    pub fn create_lot(&mut self, lot: GoodsLot) -> String {
+        let owner = env::predecessor_account_id();
+        self.require_party(&owner);
+        assert!(
+            self.catalogs.contains_key(&lot.catalog_id),
+            "Catalog entry not found"
+        );
+        assert!(lot.total_milliamount > 0, "Lot quantity must be > 0");
+
+        let lot_id = self.next_id_for("lot-");
+        let now = self.now_ms();
+
+        let mut lot = lot;
+        lot.lot_id = lot_id.clone();
+        lot.owner = owner.clone();
+        lot.origin_account = owner.clone();
+        lot.available_milliamount = lot.total_milliamount;
+        lot.provenance = vec![];
+        lot.status = LotStatus::Available;
+        lot.created_at = now;
+        lot.updated_at = now;
+
+        self.lots.insert(lot_id.clone(), lot.clone());
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(&lot_id, &EventType::LotCreated, now),
+            event_type: EventType::LotCreated,
+            entity_type: EntityType::Lot,
+            entity_id: lot_id.clone(),
+            actor: owner.to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&lot),
+        });
+
+        lot_id
+    }
+
+    /// Dispose of a lot (Spoiled, Donated, or Recalled). Caller must be the
+    /// owner or an authorized agent. Only available if lot has no active allocations.
+    pub fn dispose_lot(&mut self, lot_id: String, disposition: LotStatus, notes: Option<String>) {
+        let mut lot = self.lots.get(&lot_id).cloned().expect("Lot not found");
+        self.require_party_or_agent(&lot.owner);
+        assert!(
+            matches!(disposition, LotStatus::Spoiled | LotStatus::Donated | LotStatus::Recalled),
+            "disposition must be Spoiled, Donated, or Recalled"
+        );
+        assert!(
+            matches!(lot.status, LotStatus::Available | LotStatus::PartiallyAllocated),
+            "Lot cannot be disposed in current status"
+        );
+
+        let now = self.now_ms();
+        lot.status = disposition;
+        lot.updated_at = now;
+        self.lots.insert(lot_id.clone(), lot.clone());
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(&lot_id, &EventType::LotDisposed, now),
+            event_type: EventType::LotDisposed,
+            entity_type: EntityType::Lot,
+            entity_id: lot_id.clone(),
+            actor: env::predecessor_account_id().to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&notes),
+        });
+    }
+
+    /// Allocate quantity from a lot when a contract is formed.
+    /// Decrements available_milliamount and updates status.
+    fn allocate_lot(&mut self, lot_id: &str, milliamount: u64) {
+        let mut lot = self.lots.get(lot_id).cloned().expect("Lot not found");
+        assert!(
+            lot.available_milliamount >= milliamount,
+            "Insufficient lot quantity available"
+        );
+        lot.available_milliamount -= milliamount;
+        lot.status = if lot.available_milliamount == 0 {
+            LotStatus::FullyAllocated
+        } else {
+            LotStatus::PartiallyAllocated
+        };
+        lot.updated_at = self.now_ms();
+        self.lots.insert(lot_id.to_string(), lot);
+    }
+
+    /// Transfer lot ownership to the buyer at settlement.
+    /// Appends a ProvenanceEvent and updates owner and status.
+    fn transfer_lot_ownership(
+        &mut self,
+        lot_id: &str,
+        from: &AccountId,
+        to: &AccountId,
+        milliamount: u64,
+        unit: String,
+        contract_id: &str,
+        now: u64,
+    ) {
+        let mut lot = self.lots.get(lot_id).cloned().expect("Lot not found");
+        lot.owner = to.clone();
+        lot.status = LotStatus::Fulfilled;
+        lot.updated_at = now;
+        lot.provenance.push(ProvenanceEvent {
+            from: from.clone(),
+            to: to.clone(),
+            milliamount,
+            unit,
+            contract_id: contract_id.to_string(),
+            timestamp: now,
+        });
+        self.lots.insert(lot_id.to_string(), lot.clone());
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(lot_id, &EventType::LotOwnershipTransferred, now),
+            event_type: EventType::LotOwnershipTransferred,
+            entity_type: EntityType::Lot,
+            entity_id: lot_id.to_string(),
+            actor: contract_id.to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&lot),
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // FSMA Rule 204 — Critical Tracking Events
+    // -----------------------------------------------------------------------
+
+    /// Internal: write a CTE record, index it under all affected lot IDs, and emit an event.
+    fn write_cte(&mut self, cte: Fsma204Cte) {
+        let now = self.now_ms();
+        let cte_id = cte.cte_id.clone();
+        let lot_id = cte.lot_id.clone();
+        let output_lot_id = cte.output_lot_id.clone();
+
+        self.fsma_ctes.insert(cte_id.clone(), cte.clone());
+
+        // Index under primary lot
+        let mut idx = self.lot_cte_index.get(&lot_id).cloned().unwrap_or_default();
+        if !idx.contains(&cte_id) { idx.push(cte_id.clone()); }
+        self.lot_cte_index.insert(lot_id.clone(), idx);
+
+        // Index under output lot (Transforming CTE)
+        if let Some(ref out_id) = output_lot_id {
+            let mut out_idx = self.lot_cte_index.get(out_id).cloned().unwrap_or_default();
+            if !out_idx.contains(&cte_id) { out_idx.push(cte_id.clone()); }
+            self.lot_cte_index.insert(out_id.clone(), out_idx);
+        }
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(&cte_id, &EventType::Fsma204CteRecorded, now),
+            event_type: EventType::Fsma204CteRecorded,
+            entity_type: EntityType::Fsma204Cte,
+            entity_id: cte_id.clone(),
+            actor: cte.actor.to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&cte),
+        });
+    }
+
+    /// Record a Receiving CTE: the caller received the lot from `source_gln`.
+    /// The lot must already exist on-chain. The caller must be the current owner.
+    pub fn record_cte_receiving(
+        &mut self,
+        lot_id: String,
+        source_gln: Option<String>,
+        quantity_milliamount: u64,
+        unit: String,
+        event_date_ms: u64,
+        notes: Option<String>,
+    ) {
+        let actor = env::predecessor_account_id();
+        let lot = self.lots.get(&lot_id).cloned().expect("Lot not found");
+        self.require_party_or_agent(&lot.owner);
+
+        let cte_id = self.next_id_for("cte-");
+        let now = self.now_ms();
+
+        let party = self.parties.get(&actor).cloned().expect("Party not registered");
+
+        let cte = Fsma204Cte {
+            cte_id,
+            cte_type: Fsma204EventType::Receiving,
+            lot_id,
+            output_lot_id: None,
+            actor: actor.clone(),
+            actor_gln: party.gs1_gln.clone(),
+            source_gln,
+            dest_gln: None,
+            quantity_milliamount,
+            unit,
+            commodity: None,
+            variety: None,
+            event_date_ms,
+            recorded_at: now,
+            notes,
+        };
+
+        self.write_cte(cte);
+    }
+
+    /// Record a Shipping CTE: the caller shipped the lot to `dest_gln`.
+    /// The lot must already exist on-chain. The caller must be the current owner.
+    pub fn record_cte_shipping(
+        &mut self,
+        lot_id: String,
+        dest_gln: Option<String>,
+        quantity_milliamount: u64,
+        unit: String,
+        event_date_ms: u64,
+        notes: Option<String>,
+    ) {
+        let actor = env::predecessor_account_id();
+        let lot = self.lots.get(&lot_id).cloned().expect("Lot not found");
+        self.require_party_or_agent(&lot.owner);
+
+        let cte_id = self.next_id_for("cte-");
+        let now = self.now_ms();
+
+        let party = self.parties.get(&actor).cloned().expect("Party not registered");
+
+        let cte = Fsma204Cte {
+            cte_id,
+            cte_type: Fsma204EventType::Shipping,
+            lot_id,
+            output_lot_id: None,
+            actor: actor.clone(),
+            actor_gln: party.gs1_gln.clone(),
+            source_gln: None,
+            dest_gln,
+            quantity_milliamount,
+            unit,
+            commodity: None,
+            variety: None,
+            event_date_ms,
+            recorded_at: now,
+            notes,
+        };
+
+        self.write_cte(cte);
+    }
+
+    /// Record a Growing CTE: the caller (a farm or grower) attests to harvesting a FTL commodity.
+    ///
+    /// This is the origin event — the first link in the traceability chain. It must be
+    /// recorded by the party that owns the lot at harvest time. `field_gln` is the GS1 GLN
+    /// of the specific field or growing location; if not yet assigned, the actor's facility
+    /// GLN is used as fallback. `harvest_date_ms` is the actual physical harvest date and
+    /// may differ from the block timestamp.
+    pub fn record_cte_growing(
+        &mut self,
+        lot_id: String,
+        commodity: String,
+        variety: Option<String>,
+        harvest_date_ms: u64,
+        field_gln: Option<String>,
+        quantity_milliamount: u64,
+        unit: String,
+        notes: Option<String>,
+    ) {
+        let actor = env::predecessor_account_id();
+        let lot = self.lots.get(&lot_id).cloned().expect("Lot not found");
+        self.require_party_or_agent(&lot.owner);
+        assert!(!commodity.trim().is_empty(), "commodity must not be empty");
+
+        let cte_id = self.next_id_for("cte-");
+        let now = self.now_ms();
+
+        let party = self.parties.get(&actor).cloned().expect("Party not registered");
+        // Use the supplied field GLN if provided, otherwise fall back to party's facility GLN
+        let actor_gln = field_gln.or_else(|| party.gs1_gln.clone());
+
+        let cte = Fsma204Cte {
+            cte_id,
+            cte_type: Fsma204EventType::Growing,
+            lot_id,
+            output_lot_id: None,
+            actor: actor.clone(),
+            actor_gln,
+            source_gln: None,
+            dest_gln: None,
+            quantity_milliamount,
+            unit,
+            commodity: Some(commodity),
+            variety,
+            event_date_ms: harvest_date_ms,
+            recorded_at: now,
+            notes,
+        };
+
+        self.write_cte(cte);
+    }
+
+    /// Record a Creating CTE: the first packer assigns a Traceability Lot Code (TLC) and
+    /// records the initial pack event.
+    ///
+    /// "Creating" is the moment a TLC is born — when a packer takes raw harvested product
+    /// and packs it into a case or container, assigning the identifier the lot will carry
+    /// for the rest of its journey. This must be called by the lot owner (the first packer).
+    /// `pack_date_ms` is the actual physical pack date; `packing_facility_gln` is the GS1 GLN
+    /// of the packing facility.
+    pub fn record_cte_creating(
+        &mut self,
+        lot_id: String,
+        commodity: String,
+        variety: Option<String>,
+        pack_date_ms: u64,
+        packing_facility_gln: Option<String>,
+        quantity_milliamount: u64,
+        unit: String,
+        notes: Option<String>,
+    ) {
+        let actor = env::predecessor_account_id();
+        let lot = self.lots.get(&lot_id).cloned().expect("Lot not found");
+        self.require_party_or_agent(&lot.owner);
+        assert!(!commodity.trim().is_empty(), "commodity must not be empty");
+
+        let cte_id = self.next_id_for("cte-");
+        let now = self.now_ms();
+
+        let party = self.parties.get(&actor).cloned().expect("Party not registered");
+        let actor_gln = packing_facility_gln.or_else(|| party.gs1_gln.clone());
+
+        let cte = Fsma204Cte {
+            cte_id,
+            cte_type: Fsma204EventType::Creating,
+            lot_id,
+            output_lot_id: None,
+            actor: actor.clone(),
+            actor_gln,
+            source_gln: None,
+            dest_gln: None,
+            quantity_milliamount,
+            unit,
+            commodity: Some(commodity),
+            variety,
+            event_date_ms: pack_date_ms,
+            recorded_at: now,
+            notes,
+        };
+
+        self.write_cte(cte);
+    }
+
+    /// Transform one or more input lots into a new output lot, recording a Transforming CTE.
+    ///
+    /// Each `InputLotRef` specifies how much milliamount is consumed from an existing lot.
+    /// A new lot is created under `output_catalog_id` with `output_milliamount` total quantity.
+    /// The input lots must be owned by the caller; their available_milliamount is debited.
+    /// Returns the new output lot_id.
+    pub fn transform_lot(
+        &mut self,
+        input_lots: Vec<InputLotRef>,
+        output_catalog_id: String,
+        output_milliamount: u64,
+        output_unit: String,
+        output_lot_number: Option<String>,
+        commodity: Option<String>,
+        variety: Option<String>,
+        event_date_ms: u64,
+        notes: Option<String>,
+    ) -> String {
+        let actor = env::predecessor_account_id();
+        self.require_party(&actor);
+        assert!(!input_lots.is_empty(), "At least one input lot is required");
+        assert!(output_milliamount > 0, "Output quantity must be > 0");
+        assert!(
+            self.catalogs.contains_key(&output_catalog_id),
+            "Output catalog entry not found"
+        );
+
+        let now = self.now_ms();
+
+        // Debit input lots — each must be owned by or agented by the caller
+        for input in &input_lots {
+            let mut lot = self.lots.get(&input.lot_id).cloned()
+                .unwrap_or_else(|| panic!("Input lot not found: {}", input.lot_id));
+            self.require_party_or_agent(&lot.owner);
+            assert!(
+                lot.available_milliamount >= input.milliamount,
+                "Insufficient quantity in input lot: {}",
+                input.lot_id
+            );
+            lot.available_milliamount -= input.milliamount;
+            lot.status = if lot.available_milliamount == 0 {
+                LotStatus::FullyAllocated
+            } else {
+                LotStatus::PartiallyAllocated
+            };
+            lot.updated_at = now;
+            self.lots.insert(input.lot_id.clone(), lot);
+        }
+
+        // Create output lot
+        let output_lot_id = self.next_id_for("lot-");
+        let output_lot = GoodsLot {
+            lot_id: output_lot_id.clone(),
+            owner: actor.clone(),
+            available_milliamount: output_milliamount,
+            provenance: vec![],
+            status: LotStatus::Available,
+            created_at: now,
+            updated_at: now,
+            catalog_id: output_catalog_id.clone(),
+            origin_account: actor.clone(),
+            total_milliamount: output_milliamount,
+            unit: output_unit.clone(),
+            lot_number: output_lot_number,
+            pack_date: Some(now),
+            harvest_date: None,
+            best_by: None,
+            lot_certifications: vec![],
+            input_lots: input_lots.clone(),
+        };
+
+        self.lots.insert(output_lot_id.clone(), output_lot.clone());
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(&output_lot_id, &EventType::LotCreated, now),
+            event_type: EventType::LotCreated,
+            entity_type: EntityType::Lot,
+            entity_id: output_lot_id.clone(),
+            actor: actor.to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&output_lot),
+        });
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(&output_lot_id, &EventType::LotTransformed, now),
+            event_type: EventType::LotTransformed,
+            entity_type: EntityType::Lot,
+            entity_id: output_lot_id.clone(),
+            actor: actor.to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&output_lot),
+        });
+
+        // Record the Transforming CTE (covers all input lots via the index)
+        let party = self.parties.get(&actor).cloned().expect("Party not registered");
+        let cte_id = self.next_id_for("cte-");
+
+        // Use the first input lot_id as the primary lot for the CTE
+        let primary_lot_id = input_lots[0].lot_id.clone();
+
+        let cte = Fsma204Cte {
+            cte_id,
+            cte_type: Fsma204EventType::Transforming,
+            lot_id: primary_lot_id,
+            output_lot_id: Some(output_lot_id.clone()),
+            actor: actor.clone(),
+            actor_gln: party.gs1_gln.clone(),
+            source_gln: None,
+            dest_gln: None,
+            quantity_milliamount: output_milliamount,
+            unit: output_unit,
+            commodity,
+            variety,
+            event_date_ms,
+            recorded_at: now,
+            notes,
+        };
+
+        // Index all input lots under this CTE for full one-up/one-down traceability
+        let cte_id_ref = cte.cte_id.clone();
+        self.fsma_ctes.insert(cte_id_ref.clone(), cte.clone());
+        for input in &input_lots {
+            let mut idx = self.lot_cte_index.get(&input.lot_id).cloned().unwrap_or_default();
+            if !idx.contains(&cte_id_ref) { idx.push(cte_id_ref.clone()); }
+            self.lot_cte_index.insert(input.lot_id.clone(), idx);
+        }
+        // Index output lot
+        let mut out_idx = self.lot_cte_index.get(&output_lot_id).cloned().unwrap_or_default();
+        if !out_idx.contains(&cte_id_ref) { out_idx.push(cte_id_ref.clone()); }
+        self.lot_cte_index.insert(output_lot_id.clone(), out_idx);
+
+        let now2 = self.now_ms();
+        self.emit(AuditEvent {
+            event_id: make_event_id(&cte_id_ref, &EventType::Fsma204CteRecorded, now2),
+            event_type: EventType::Fsma204CteRecorded,
+            entity_type: EntityType::Fsma204Cte,
+            entity_id: cte_id_ref,
+            actor: actor.to_string(),
+            timestamp: now2,
+            payload_hash: hash_payload(&cte),
+        });
+
+        output_lot_id
+    }
+
+    /// Anchor a Certificate of Analysis (COA) to a lot.
+    ///
+    /// The COA document is stored off-chain (S3, IPFS, etc.). Only its SHA-256 hex
+    /// hash or IPFS CIDv1 is stored on-chain for tamper-evidence. The caller must
+    /// be the lot owner or an authorized agent.
+    ///
+    /// - `cert_type`: human-readable label (e.g. "COA", "Lab Test", "USDA Organic")
+    /// - `issuer`: name of the certifying body or lab
+    /// - `doc_hash`: SHA-256 hex (64 chars) or IPFS CIDv1 of the document
+    /// - `expires_at`: optional expiry timestamp in Unix ms
+    pub fn anchor_coa(
+        &mut self,
+        lot_id: String,
+        cert_type: String,
+        issuer: String,
+        doc_hash: String,
+        expires_at: Option<u64>,
+    ) {
+        let actor = env::predecessor_account_id();
+        let mut lot = self.lots.get(&lot_id).cloned().expect("Lot not found");
+        self.require_party_or_agent(&lot.owner);
+
+        // Basic hash format validation
+        assert!(
+            doc_hash.len() == 64 || doc_hash.starts_with("baf"),
+            "doc_hash must be a 64-char SHA-256 hex string or an IPFS CIDv1 (starts with 'baf')"
+        );
+        assert!(!cert_type.trim().is_empty(), "cert_type must not be empty");
+        assert!(!issuer.trim().is_empty(), "issuer must not be empty");
+
+        let now = self.now_ms();
+
+        lot.lot_certifications.push(LotCertRef {
+            cert_type: cert_type.clone(),
+            issuer: issuer.clone(),
+            issued_at: now,
+            expires_at,
+            doc_hash: Some(doc_hash.clone()),
+            status: CertStatus::Active,
+        });
+        lot.updated_at = now;
+        self.lots.insert(lot_id.clone(), lot.clone());
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(&lot_id, &EventType::LotCOAAnchored, now),
+            event_type: EventType::LotCOAAnchored,
+            entity_type: EntityType::Lot,
+            entity_id: lot_id.clone(),
+            actor: actor.to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&doc_hash),
+        });
+    }
+
+    /// Return all FSMA 204 CTEs recorded for a given lot (as actor, source, or output).
+    pub fn get_lot_ctes(&self, lot_id: String) -> Vec<Fsma204Cte> {
+        let cte_ids = self.lot_cte_index.get(&lot_id).cloned().unwrap_or_default();
+        cte_ids.iter()
+            .filter_map(|id| self.fsma_ctes.get(id).cloned())
+            .collect()
+    }
+
+    /// Return a single FSMA 204 CTE by its ID.
+    pub fn get_cte(&self, cte_id: String) -> Option<Fsma204Cte> {
+        self.fsma_ctes.get(&cte_id).cloned()
+    }
+
+    // -----------------------------------------------------------------------
+    // Finance pool registry
+    // -----------------------------------------------------------------------
+
+    /// Register a new DeFi liquidity pool. Owner only.
+    /// The pool_account is the NEAR contract authorized to call confirm_financing.
+    pub fn register_finance_pool(
+        &mut self,
+        pool_id: String,
+        pool_account: AccountId,
+        max_rate_bps: u16,
+        available_microdollars: u128,
+    ) {
+        let caller = env::predecessor_account_id();
+        assert_eq!(caller, self.owner, "Owner only");
+        assert!(!self.finance_pools.contains_key(&pool_id), "Pool already registered");
+        assert!(max_rate_bps <= 5000, "max_rate_bps must be <= 5000 (50%)");
+
+        let now = self.now_ms();
+        let pool = FinancePool {
+            pool_id: pool_id.clone(),
+            pool_account: pool_account.clone(),
+            max_rate_bps,
+            available_microdollars,
+            deployed_microdollars: 0,
+            active: true,
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.finance_pools.insert(pool_id.clone(), pool.clone());
+
+        self.emit(AuditEvent {
+            event_id: make_event_id(&pool_id, &EventType::FinancePoolRegistered, now),
+            event_type: EventType::FinancePoolRegistered,
+            entity_type: EntityType::FinancePool,
+            entity_id: pool_id,
+            actor: caller.to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&pool),
+        });
+    }
+
+    /// Called by the registered pool_account to confirm it has funded a contract.
+    /// The pool emits this after transferring capital; DTP records the confirmation
+    /// and the contract can proceed knowing financing is in place.
+    pub fn confirm_financing(&mut self, contract_id: String, pool_id: String) {
+        let caller = env::predecessor_account_id();
+        let pool = self.finance_pools.get(&pool_id).cloned().expect("Finance pool not found");
+        assert_eq!(caller, pool.pool_account, "Only pool_account can confirm financing");
+        assert!(pool.active, "Finance pool is not active");
+
+        let contract = self.contracts.get(&contract_id).cloned().expect("Contract not found");
+        assert!(
+            matches!(contract.finance.as_ref().map(|f| &f.financing_mode),
+                Some(FinancingMode::LpPool)),
+            "Contract does not use LP pool financing"
+        );
+
+        let now = self.now_ms();
+        self.emit(AuditEvent {
+            event_id: make_event_id(&contract_id, &EventType::FinancingConfirmed, now),
+            event_type: EventType::FinancingConfirmed,
+            entity_type: EntityType::Contract,
+            entity_id: contract_id.clone(),
+            actor: caller.to_string(),
+            timestamp: now,
+            payload_hash: hash_payload(&pool_id),
+        });
+    }
+
+    pub fn get_finance_pool(&self, pool_id: String) -> Option<FinancePool> {
+        self.finance_pools.get(&pool_id).cloned()
+    }
+
+    // -----------------------------------------------------------------------
     // Matching helpers (read-only)
     // -----------------------------------------------------------------------
 
@@ -904,12 +1833,117 @@ impl DTPContract {
     pub fn check_match(&self, intent_id: String, listing_id: String) -> MatchResult {
         let intent = self.intents.get(&intent_id).cloned().expect("Intent not found");
         let listing = self.listings.get(&listing_id).cloned().expect("Listing not found");
-        let result = matching::check_listing_vs_intent(&intent, &listing, self.now_ms());
+        let seller_rep = self.parties.get(&listing.seller)
+            .map(|p| p.reputation.score);
+        // Resolve the catalog_id of the lot backing this listing, if any
+        let listing_catalog_id = listing.lot_id.as_ref()
+            .and_then(|lid| self.lots.get(lid))
+            .map(|lot| lot.catalog_id.clone());
+        let result = matching::check_listing_vs_intent(
+            &intent, &listing, self.now_ms(), seller_rep, listing_catalog_id,
+        );
         MatchResult {
             eligible: result.eligible,
             score: result.score,
             reasons: result.reasons,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Bidirectional match discovery
+    // -----------------------------------------------------------------------
+
+    /// Given a buyer's intent, scan all active listings and return eligible
+    /// matches sorted by score descending.  Pagination is applied after
+    /// sorting so the caller always gets the best matches at offset 0.
+    ///
+    /// Only listings with status Active are considered.
+    pub fn find_matches_for_intent(
+        &self,
+        intent_id: String,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<RankedMatch> {
+        let intent = self.intents.get(&intent_id).cloned().expect("Intent not found");
+        let now = self.now_ms();
+
+        let mut matches: Vec<RankedMatch> = self
+            .listings
+            .iter()
+            .filter(|(_, l)| l.status == ListingStatus::Active)
+            .filter_map(|(listing_id, listing)| {
+                let seller_rep = self.parties.get(&listing.seller).map(|p| p.reputation.score);
+                let listing_catalog_id = listing.lot_id.as_ref()
+                    .and_then(|lid| self.lots.get(lid))
+                    .map(|lot| lot.catalog_id.clone());
+                let result = matching::check_listing_vs_intent(
+                    &intent, listing, now, seller_rep, listing_catalog_id,
+                );
+                if result.eligible {
+                    Some(RankedMatch {
+                        intent_id: intent_id.clone(),
+                        listing_id: listing_id.clone(),
+                        score: result.score,
+                        reasons: vec![],
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        matches.sort_by(|a, b| b.score.cmp(&a.score));
+        matches
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect()
+    }
+
+    /// Given a seller's listing, scan all posted intents and return eligible
+    /// matches sorted by score descending.
+    ///
+    /// Only intents with status Posted are considered.
+    pub fn find_matches_for_listing(
+        &self,
+        listing_id: String,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<RankedMatch> {
+        let listing = self.listings.get(&listing_id).cloned().expect("Listing not found");
+        let now = self.now_ms();
+        let seller_rep = self.parties.get(&listing.seller).map(|p| p.reputation.score);
+        let listing_catalog_id = listing.lot_id.as_ref()
+            .and_then(|lid| self.lots.get(lid))
+            .map(|lot| lot.catalog_id.clone());
+
+        let mut matches: Vec<RankedMatch> = self
+            .intents
+            .iter()
+            .filter(|(_, i)| i.status == IntentStatus::Posted)
+            .filter_map(|(intent_id, intent)| {
+                let result = matching::check_listing_vs_intent(
+                    intent, &listing, now, seller_rep, listing_catalog_id.clone(),
+                );
+                if result.eligible {
+                    Some(RankedMatch {
+                        intent_id: intent_id.clone(),
+                        listing_id: listing_id.clone(),
+                        score: result.score,
+                        reasons: vec![],
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        matches.sort_by(|a, b| b.score.cmp(&a.score));
+        matches
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect()
     }
 
     /// Return tier comparison data for a buyer considering a listing.
@@ -931,6 +1965,14 @@ impl DTPContract {
 
     pub fn get_party(&self, account: AccountId) -> Option<Party> {
         self.parties.get(&account).cloned()
+    }
+
+    pub fn get_catalog_entry(&self, catalog_id: String) -> Option<GoodsCatalogEntry> {
+        self.catalogs.get(&catalog_id).cloned()
+    }
+
+    pub fn get_lot(&self, lot_id: String) -> Option<GoodsLot> {
+        self.lots.get(&lot_id).cloned()
     }
 
     pub fn get_intent(&self, intent_id: String) -> Option<TradeIntent> {
@@ -966,38 +2008,161 @@ impl DTPContract {
         self.standing_agreements.get(&agreement_id).cloned()
     }
 
+    // -----------------------------------------------------------------------
+    // Account summary (portable account snapshot)
+    // -----------------------------------------------------------------------
+
+    /// Returns the full on-chain snapshot of an account.
+    /// Any DTP-compatible platform can call this to read an account's
+    /// complete state without a custom connector.
+    /// Returns None if the account is not a registered party.
+    pub fn get_account_summary(&self, account: AccountId) -> Option<AccountSummary> {
+        let party = self.parties.get(&account).cloned()?;
+
+        let catalog_count = self.catalogs.iter()
+            .filter(|(_, e)| e.owner == account)
+            .count() as u64;
+
+        let lots_owned = self.lots.iter()
+            .filter(|(_, l)| l.owner == account)
+            .count() as u64;
+
+        let active_listings = self.listings.iter()
+            .filter(|(_, l)| l.seller == account && l.status == ListingStatus::Active)
+            .count() as u64;
+
+        let active_intents = self.intents.iter()
+            .filter(|(_, i)| i.buyer == account && i.status == IntentStatus::Posted)
+            .count() as u64;
+
+        let open_contracts = self.contracts.iter()
+            .filter(|(_, c)| {
+                (c.buyer == account || c.seller == account)
+                    && !matches!(c.status, ContractStatus::Settled
+                        | ContractStatus::ResolvedBuyer
+                        | ContractStatus::ResolvedSeller
+                        | ContractStatus::Cancelled)
+            })
+            .count() as u64;
+
+        // Total volume: sum all settlements where account was buyer or seller
+        let total_volume_microdollars = self.settlements.iter()
+            .filter_map(|(_, s)| {
+                self.contracts.get(&s.contract_id)
+                    .filter(|c| c.buyer == account || c.seller == account)
+                    .map(|_| s.net_amount)
+            })
+            .fold(0u128, |acc, v| acc.saturating_add(v));
+
+        Some(AccountSummary {
+            party: party.clone(),
+            catalog_count,
+            lots_owned,
+            active_listings,
+            active_intents,
+            open_contracts,
+            total_trades: party.reputation.trades_completed,
+            total_volume_microdollars,
+            protocol_version: self.protocol_version.clone(),
+            queried_at: self.now_ms(),
+        })
+    }
+
+    /// Paginated list of catalog entries owned by an account.
+    pub fn get_account_catalogs(
+        &self,
+        account: AccountId,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<GoodsCatalogEntry> {
+        self.catalogs.iter()
+            .filter(|(_, e)| e.owner == account)
+            .skip(offset as usize)
+            .take(limit as usize)
+            .map(|(_, e)| e.clone())
+            .collect()
+    }
+
+    /// Paginated list of lots currently owned by an account.
+    pub fn get_account_lots(
+        &self,
+        account: AccountId,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<GoodsLot> {
+        self.lots.iter()
+            .filter(|(_, l)| l.owner == account)
+            .skip(offset as usize)
+            .take(limit as usize)
+            .map(|(_, l)| l.clone())
+            .collect()
+    }
+
+    /// Paginated list of active supply listings for an account.
+    pub fn get_account_listings(
+        &self,
+        account: AccountId,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<SupplyListing> {
+        self.listings.iter()
+            .filter(|(_, l)| l.seller == account)
+            .skip(offset as usize)
+            .take(limit as usize)
+            .map(|(_, l)| l.clone())
+            .collect()
+    }
+
+    /// Paginated list of posted trade intents for an account.
+    pub fn get_account_intents(
+        &self,
+        account: AccountId,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<TradeIntent> {
+        self.intents.iter()
+            .filter(|(_, i)| i.buyer == account)
+            .skip(offset as usize)
+            .take(limit as usize)
+            .map(|(_, i)| i.clone())
+            .collect()
+    }
+
+    /// Paginated list of contracts (as buyer or seller) for an account.
+    pub fn get_account_contracts(
+        &self,
+        account: AccountId,
+        offset: u64,
+        limit: u64,
+    ) -> Vec<TradeContract> {
+        self.contracts.iter()
+            .filter(|(_, c)| c.buyer == account || c.seller == account)
+            .skip(offset as usize)
+            .take(limit as usize)
+            .map(|(_, c)| c.clone())
+            .collect()
+    }
+
     /// Get paginated audit trail entries for a specific entity.
     pub fn get_audit_trail(&self, entity_id: String, offset: u64, limit: u64) -> Vec<AuditEvent> {
-        let total = self.audit_log.len() as u64;
-        let mut results = vec![];
-        let mut count = 0u64;
-        let mut skipped = 0u64;
-
-        for i in 0..total {
-            let event = self.audit_log.get(i as u32).cloned().unwrap();
-            if event.entity_id == entity_id {
-                if skipped < offset {
-                    skipped += 1;
-                    continue;
-                }
-                if count >= limit {
-                    break;
-                }
-                results.push(event);
-                count += 1;
-            }
-        }
-        results
+        let indices = self.audit_index.get(&entity_id).cloned().unwrap_or_default();
+        let start = (offset as usize).min(indices.len());
+        let end = ((offset + limit) as usize).min(indices.len());
+        indices[start..end]
+            .iter()
+            .map(|&i| self.audit_log.get(i).cloned().unwrap())
+            .collect()
     }
 
     // -----------------------------------------------------------------------
     // Internal: reputation + relationship updates
     // -----------------------------------------------------------------------
 
-    fn update_reputation(&mut self, account: &AccountId, completed: bool, on_time: bool) {
+    fn update_reputation(&mut self, account: &AccountId, completed: bool, disputed: bool, on_time: bool) {
         if let Some(mut party) = self.parties.get(account).cloned() {
             if completed { party.reputation.trades_completed += 1; }
-            if on_time  { party.reputation.trades_settled_on_time += 1; }
+            if disputed  { party.reputation.trades_disputed += 1; }
+            if on_time   { party.reputation.trades_settled_on_time += 1; }
             party.reputation.last_updated = self.now_ms();
             party.reputation.recompute();
             self.parties.insert(account.clone(), party);
@@ -1032,6 +2197,16 @@ impl DTPContract {
         rel.total_volume += volume;
         rel.last_trade_at = now;
         rel.updated_at = now;
+
+        // Update on-time delivery rate as a running weighted average (basis points)
+        let n = rel.trades_completed as u64;
+        let prev = rel.on_time_delivery_rate_bp as u64;
+        rel.on_time_delivery_rate_bp = if on_time {
+            ((prev * (n - 1) + 10_000) / n) as u32
+        } else {
+            ((prev * (n - 1)) / n) as u32
+        };
+
         rel.tier = RelationshipTier::derive(
             rel.trades_completed,
             rel.total_volume,
@@ -1065,6 +2240,21 @@ pub struct MatchResult {
     pub reasons: Vec<String>,
 }
 
+/// A single entry in a bidirectional match-discovery result set.
+/// Returned by find_matches_for_intent and find_matches_for_listing,
+/// sorted by score descending (best match first).
+#[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
+#[serde(crate = "near_sdk::serde")]
+#[borsh(crate = "near_sdk::borsh")]
+pub struct RankedMatch {
+    pub intent_id: String,
+    pub listing_id: String,
+    /// Composite match score 0–10000 (higher is better).
+    pub score: u32,
+    /// Reserved for future use (ineligible results with failure reasons).
+    pub reasons: Vec<String>,
+}
+
 #[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
 #[serde(crate = "near_sdk::serde")]
 #[borsh(crate = "near_sdk::borsh")]
@@ -1073,6 +2263,29 @@ pub struct TierComparisonResult {
     pub price_per_unit: u128,
     pub total_price: u128,
     pub pct_savings_vs_asking: i32,
+}
+
+/// Portable account snapshot returned by get_account_summary.
+/// This is the DTP "plug-in" read surface — any DTP-compatible platform
+/// can call this to get the full picture of an account's on-chain state.
+#[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
+#[serde(crate = "near_sdk::serde")]
+#[borsh(crate = "near_sdk::borsh")]
+pub struct AccountSummary {
+    pub party: Party,
+    /// Counts of active/owned entities (use paginated queries for full lists)
+    pub catalog_count: u64,
+    pub lots_owned: u64,
+    pub active_listings: u64,
+    pub active_intents: u64,
+    /// Contracts where this account is buyer or seller, not yet settled
+    pub open_contracts: u64,
+    /// Total completed trades (from reputation record)
+    pub total_trades: u32,
+    /// Total settled volume in microdollars (1 USDC = 1_000_000)
+    pub total_volume_microdollars: u128,
+    pub protocol_version: String,
+    pub queried_at: u64,
 }
 
 #[derive(Serialize, Deserialize, BorshDeserialize, BorshSerialize)]
@@ -1089,6 +2302,69 @@ mod tests {
 
     fn owner() -> AccountId {
         "owner.testnet".parse().unwrap()
+    }
+
+    fn sample_pack() -> PackDefinition {
+        PackDefinition {
+            trade_unit: "lb".to_string(),
+            case_weight: Some(Quantity::new(30_000, "lb")),
+            each: None,
+            case: None,
+            pallet: None,
+        }
+    }
+
+    fn sample_catalog_entry() -> GoodsCatalogEntry {
+        GoodsCatalogEntry {
+            catalog_id: String::new(),
+            owner: owner(),
+            version: 0,
+            gtin: None,
+            brand: None,
+            product_name: "Organic IQF Blueberries".to_string(),
+            internal_sku: Some("SKU-001".to_string()),
+            category: "food.produce.berries.blueberries".to_string(),
+            commodity: Some("blueberries".to_string()),
+            variety: Some("Duke".to_string()),
+            grade: Some("USDA Fancy".to_string()),
+            growing_region: None,
+            country_of_origin: Some("US".to_string()),
+            preparation: Some(Preparation::IQF),
+            storage_condition: StorageCondition::Frozen,
+            shelf_life_days: Some(365),
+            pack: sample_pack(),
+            catch_weight: false,
+            ingredients: None,
+            allergens: vec![],
+            nutrition_hash: None,
+            certifications: vec![],
+            attributes: vec![],
+            media_hashes: vec![],
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn sample_lot(catalog_id: String) -> GoodsLot {
+        GoodsLot {
+            lot_id: String::new(),
+            owner: owner(),
+            available_milliamount: 0,
+            provenance: vec![],
+            status: LotStatus::Available,
+            created_at: 0,
+            updated_at: 0,
+            catalog_id,
+            origin_account: owner(),
+            total_milliamount: 500_000, // 500 lb
+            unit: "lb".to_string(),
+            lot_number: Some("LOT-2026-001".to_string()),
+            pack_date: None,
+            harvest_date: None,
+            best_by: None,
+            lot_certifications: vec![],
+            input_lots: vec![],
+        }
     }
 
     fn sample_finance(net_days: u16, paca_covered: bool) -> FinanceTerms {
@@ -1133,5 +2409,465 @@ mod tests {
             booked_at_contract: false,
         });
         c.validate_freight_terms(&freight);
+    }
+
+    fn setup_with_party() -> DTPContract {
+        near_sdk::testing_env!(near_sdk::test_utils::VMContextBuilder::new()
+            .predecessor_account_id(owner())
+            .build());
+        let mut c = DTPContract::new(owner());
+        c.parties.insert(owner(), Party {
+            party_id: owner(),
+            business_name: "Acme Foods".to_string(),
+            business_type: BusinessType::Producer,
+            jurisdiction: "US".to_string(),
+            kyb: None,
+            certifications: vec![],
+            reputation: ReputationRecord::default(),
+            authorized_agents: vec![],
+            created_at: 0,
+            gs1_gln: None,
+            duns_number: None,
+            fsma_pcqi_on_file: false,
+            facility_allergens: vec![],
+            data_vault_uri: None,
+        });
+        c
+    }
+
+    #[test]
+    fn catalog_entry_creation_assigns_system_fields() {
+        let mut c = setup_with_party();
+        let id = c.create_catalog_entry(sample_catalog_entry());
+        let stored = c.get_catalog_entry(id.clone()).unwrap();
+        assert!(id.starts_with("cat-"), "ID should have cat- prefix, got {}", id);
+        assert_eq!(stored.catalog_id, id);
+        assert_eq!(stored.version, 1);
+        assert_eq!(stored.product_name, "Organic IQF Blueberries");
+        assert_eq!(stored.preparation, Some(Preparation::IQF));
+    }
+
+    #[test]
+    fn lot_creation_sets_available_equal_to_total() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+        let stored = c.get_lot(lot_id.clone()).unwrap();
+        assert!(lot_id.starts_with("lot-"), "ID should have lot- prefix");
+        assert_eq!(stored.status, LotStatus::Available);
+        assert_eq!(stored.available_milliamount, 500_000);
+        assert_eq!(stored.total_milliamount, 500_000);
+    }
+
+    #[test]
+    fn lot_allocation_decrements_available() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+        c.allocate_lot(&lot_id, 200_000); // 200 lb
+        let stored = c.get_lot(lot_id).unwrap();
+        assert_eq!(stored.available_milliamount, 300_000);
+        assert_eq!(stored.status, LotStatus::PartiallyAllocated);
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient lot quantity available")]
+    fn lot_allocation_rejects_over_quantity() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+        c.allocate_lot(&lot_id, 600_000); // more than 500 lb total
+    }
+
+    fn sample_goods_spec(qty_milliamount: u64, ceiling_or_ask: u128) -> (GoodsSpec, DeliverySpec, BuyerPricing, SellerPricing) {
+        let goods = GoodsSpec {
+            category: "food.produce.berries".to_string(),
+            product_name: "IQF Blueberries".to_string(),
+            description: "Frozen blueberries".to_string(),
+            product_type: ProductType::Commodity,
+            commodity_details: None,
+            branded_details: None,
+            value_added_details: None,
+            quantity: Quantity::new(qty_milliamount, "lb"),
+            grade: "USDA Fancy".to_string(),
+            quality_specs: vec![],
+            required_certifications: vec![],
+            packaging: "case".to_string(),
+            shelf_life_days: None,
+        };
+        // delivery window: 2000..4000 ms (test epoch)
+        let delivery = DeliverySpec {
+            destination_city: "Portland".to_string(),
+            destination_state: "OR".to_string(),
+            destination_zip: "97201".to_string(),
+            destination_country: "US".to_string(),
+            window_earliest: 2000,
+            window_latest: 4000,
+            method: DeliveryMethod::Delivered,
+            temperature: None,
+            notes: None,
+        };
+        let buyer_pricing = BuyerPricing { ceiling_price_per_unit: ceiling_or_ask };
+        let seller_pricing = SellerPricing {
+            model: PricingModel::Flat,
+            asking_price_per_unit: ceiling_or_ask,
+            tiers: vec![],
+        };
+        (goods, delivery, buyer_pricing, seller_pricing)
+    }
+
+    fn insert_intent(c: &mut DTPContract, buyer: AccountId, qty: u64, ceiling: u128, expires_at: u64) -> String {
+        let (goods, delivery, pricing, _) = sample_goods_spec(qty, ceiling);
+        let id = format!("int-test-{}", c.intents.len());
+        let intent = TradeIntent {
+            intent_id: id.clone(),
+            version: "0.1".to_string(),
+            buyer,
+            catalog_id: None,
+            goods,
+            delivery,
+            pricing,
+            finance: None,
+            freight: None,
+            expires_at,
+            status: IntentStatus::Posted,
+            created_at: 0,
+            updated_at: 0,
+        };
+        c.intents.insert(id.clone(), intent);
+        id
+    }
+
+    fn insert_listing(c: &mut DTPContract, seller: AccountId, qty: u64, ask: u128, expires_at: u64) -> String {
+        let (goods, delivery, _, pricing) = sample_goods_spec(qty, ask);
+        let id = format!("lst-test-{}", c.listings.len());
+        let listing = SupplyListing {
+            listing_id: id.clone(),
+            version: "0.1".to_string(),
+            seller,
+            lot_id: None,
+            goods,
+            pack_structure: PackStructure {
+                unit_size: Quantity::new(1000, "lb"),
+                units_per_case: 1,
+                cases_per_pallet: 40,
+                pallets_per_truckload: None,
+                moq: Quantity::new(1000, "lb"),
+                moq_label: "1 lb".to_string(),
+            },
+            delivery,
+            pricing,
+            finance: None,
+            freight: None,
+            certifications: vec![],
+            available_from: 0,
+            expires_at,
+            status: ListingStatus::Active,
+            created_at: 0,
+        };
+        c.listings.insert(id.clone(), listing);
+        id
+    }
+
+    #[test]
+    fn find_matches_for_intent_returns_eligible_listings() {
+        let mut c = setup_with_party();
+        let seller: AccountId = "seller.testnet".parse().unwrap();
+
+        // Intent: 100 lb, ceiling $2.00/lb (2_000_000 microdollars), expires far future
+        let intent_id = insert_intent(&mut c, owner(), 100_000, 2_000_000, u64::MAX);
+
+        // Matching listing: 200 lb (≥100), ask $1.80 (≤$2.00 ceiling), overlapping window
+        let _good_id = insert_listing(&mut c, seller.clone(), 200_000, 1_800_000, u64::MAX);
+        // Non-matching listing: ask $2.50 (exceeds ceiling)
+        let _bad_id = insert_listing(&mut c, seller, 200_000, 2_500_000, u64::MAX);
+
+        let results = c.find_matches_for_intent(intent_id, 0, 10);
+        assert_eq!(results.len(), 1, "Only one listing should be eligible");
+        assert_eq!(results[0].listing_id, _good_id);
+        assert!(results[0].score > 0);
+    }
+
+    #[test]
+    fn find_matches_for_listing_returns_eligible_intents() {
+        let mut c = setup_with_party();
+        let buyer: AccountId = "buyer.testnet".parse().unwrap();
+
+        // Listing: 500 lb at $1.50/lb
+        let listing_id = insert_listing(&mut c, owner(), 500_000, 1_500_000, u64::MAX);
+
+        // Eligible intent: wants 100 lb, ceiling $2.00 (≥ ask $1.50), overlapping window
+        let _good_id = insert_intent(&mut c, buyer.clone(), 100_000, 2_000_000, u64::MAX);
+        // Ineligible intent: ceiling $1.00 < ask $1.50
+        let _bad_id = insert_intent(&mut c, buyer, 100_000, 1_000_000, u64::MAX);
+
+        let results = c.find_matches_for_listing(listing_id, 0, 10);
+        assert_eq!(results.len(), 1, "Only one intent should be eligible");
+        assert_eq!(results[0].intent_id, _good_id);
+        assert!(results[0].score > 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // FSMA 204 CTE tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cte_growing_records_and_indexes_under_lot() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        c.record_cte_growing(
+            lot_id.clone(),
+            "blueberries".to_string(),
+            Some("Duke".to_string()),
+            1_000,   // harvest_date_ms
+            Some("0614141000005".to_string()), // field GLN
+            500_000, // 500 lb
+            "lb".to_string(),
+            None,
+        );
+
+        let ctes = c.get_lot_ctes(lot_id.clone());
+        assert_eq!(ctes.len(), 1);
+        assert_eq!(ctes[0].cte_type, Fsma204EventType::Growing);
+        assert_eq!(ctes[0].commodity, Some("blueberries".to_string()));
+        assert_eq!(ctes[0].variety, Some("Duke".to_string()));
+        assert_eq!(ctes[0].actor_gln, Some("0614141000005".to_string()));
+        assert!(ctes[0].cte_id.starts_with("cte-"));
+    }
+
+    #[test]
+    fn cte_growing_falls_back_to_party_gln_when_field_gln_absent() {
+        let mut c = setup_with_party();
+        // Give the party a GLN
+        c.parties.get_mut(&owner()).map(|p| p.gs1_gln = Some("1234567890123".to_string()));
+
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        c.record_cte_growing(
+            lot_id.clone(),
+            "tomatoes".to_string(),
+            None,
+            1_000,
+            None, // no field GLN supplied
+            100_000,
+            "lb".to_string(),
+            None,
+        );
+
+        let ctes = c.get_lot_ctes(lot_id);
+        assert_eq!(ctes[0].actor_gln, Some("1234567890123".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "commodity must not be empty")]
+    fn cte_growing_rejects_empty_commodity() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+        c.record_cte_growing(lot_id, "".to_string(), None, 1_000, None, 100_000, "lb".to_string(), None);
+    }
+
+    #[test]
+    fn cte_creating_records_and_indexes_under_lot() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        c.record_cte_creating(
+            lot_id.clone(),
+            "blueberries".to_string(),
+            Some("Duke".to_string()),
+            2_000,   // pack_date_ms
+            Some("0614141000012".to_string()), // packing facility GLN
+            500_000,
+            "lb".to_string(),
+            Some("First pack of season".to_string()),
+        );
+
+        let ctes = c.get_lot_ctes(lot_id);
+        assert_eq!(ctes.len(), 1);
+        assert_eq!(ctes[0].cte_type, Fsma204EventType::Creating);
+        assert_eq!(ctes[0].commodity, Some("blueberries".to_string()));
+        assert_eq!(ctes[0].actor_gln, Some("0614141000012".to_string()));
+        assert_eq!(ctes[0].notes, Some("First pack of season".to_string()));
+    }
+
+    #[test]
+    fn cte_receiving_records_source_gln() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        c.record_cte_receiving(
+            lot_id.clone(),
+            Some("9876543210987".to_string()), // source GLN (shipper's location)
+            500_000,
+            "lb".to_string(),
+            3_000,
+            None,
+        );
+
+        let ctes = c.get_lot_ctes(lot_id);
+        assert_eq!(ctes.len(), 1);
+        assert_eq!(ctes[0].cte_type, Fsma204EventType::Receiving);
+        assert_eq!(ctes[0].source_gln, Some("9876543210987".to_string()));
+        assert_eq!(ctes[0].dest_gln, None);
+    }
+
+    #[test]
+    fn cte_shipping_records_dest_gln() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        c.record_cte_shipping(
+            lot_id.clone(),
+            Some("1111111111111".to_string()), // destination GLN
+            500_000,
+            "lb".to_string(),
+            4_000,
+            None,
+        );
+
+        let ctes = c.get_lot_ctes(lot_id);
+        assert_eq!(ctes.len(), 1);
+        assert_eq!(ctes[0].cte_type, Fsma204EventType::Shipping);
+        assert_eq!(ctes[0].dest_gln, Some("1111111111111".to_string()));
+        assert_eq!(ctes[0].source_gln, None);
+    }
+
+    #[test]
+    fn multiple_ctes_on_same_lot_all_indexed() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        // Farm records Growing, then Creating, then ships
+        c.record_cte_growing(lot_id.clone(), "blueberries".to_string(), None, 1_000, None, 500_000, "lb".to_string(), None);
+        c.record_cte_creating(lot_id.clone(), "blueberries".to_string(), None, 2_000, None, 500_000, "lb".to_string(), None);
+        c.record_cte_shipping(lot_id.clone(), None, 500_000, "lb".to_string(), 3_000, None);
+
+        let ctes = c.get_lot_ctes(lot_id);
+        assert_eq!(ctes.len(), 3);
+        // Order matches insertion order
+        assert_eq!(ctes[0].cte_type, Fsma204EventType::Growing);
+        assert_eq!(ctes[1].cte_type, Fsma204EventType::Creating);
+        assert_eq!(ctes[2].cte_type, Fsma204EventType::Shipping);
+    }
+
+    #[test]
+    fn transform_lot_indexes_cte_under_all_input_and_output_lots() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let input_lot_id = c.create_lot(sample_lot(catalog_id.clone()));
+
+        let output_lot_id = c.transform_lot(
+            vec![InputLotRef { lot_id: input_lot_id.clone(), milliamount: 500_000, unit: "lb".to_string() }],
+            catalog_id,
+            400_000,
+            "lb".to_string(),
+            Some("PACK-OUT-001".to_string()),
+            Some("blueberries".to_string()),
+            None,
+            1_000,
+            None,
+        );
+
+        // Input lot should have a Transforming CTE
+        let input_ctes = c.get_lot_ctes(input_lot_id);
+        assert_eq!(input_ctes.len(), 1);
+        assert_eq!(input_ctes[0].cte_type, Fsma204EventType::Transforming);
+        assert_eq!(input_ctes[0].output_lot_id, Some(output_lot_id.clone()));
+
+        // Output lot should also have the same Transforming CTE indexed
+        let output_ctes = c.get_lot_ctes(output_lot_id.clone());
+        assert_eq!(output_ctes.len(), 1); // LotCreated and LotTransformed events are audit events, not CTEs
+        assert_eq!(output_ctes[0].cte_id, input_ctes[0].cte_id);
+
+        // Output lot should exist and have the right quantity
+        let out_lot = c.get_lot(output_lot_id).unwrap();
+        assert_eq!(out_lot.total_milliamount, 400_000);
+        assert_eq!(out_lot.input_lots.len(), 1);
+
+        // Input lot should be fully consumed
+        let in_lot = c.get_lot(input_ctes[0].lot_id.clone()).unwrap();
+        assert_eq!(in_lot.available_milliamount, 0);
+        assert_eq!(in_lot.status, LotStatus::FullyAllocated);
+    }
+
+    #[test]
+    fn anchor_coa_attaches_hash_to_lot() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+
+        let doc_hash = "a".repeat(64); // valid 64-char SHA-256 hex
+        c.anchor_coa(
+            lot_id.clone(),
+            "COA".to_string(),
+            "Eurofins Scientific".to_string(),
+            doc_hash.clone(),
+            Some(9_999_999),
+        );
+
+        let lot = c.get_lot(lot_id).unwrap();
+        assert_eq!(lot.lot_certifications.len(), 1);
+        assert_eq!(lot.lot_certifications[0].cert_type, "COA");
+        assert_eq!(lot.lot_certifications[0].issuer, "Eurofins Scientific");
+        assert_eq!(lot.lot_certifications[0].doc_hash, Some(doc_hash));
+        assert_eq!(lot.lot_certifications[0].expires_at, Some(9_999_999));
+        assert_eq!(lot.lot_certifications[0].status, CertStatus::Active);
+    }
+
+    #[test]
+    #[should_panic(expected = "doc_hash must be a 64-char SHA-256")]
+    fn anchor_coa_rejects_invalid_hash() {
+        let mut c = setup_with_party();
+        let catalog_id = c.create_catalog_entry(sample_catalog_entry());
+        let lot_id = c.create_lot(sample_lot(catalog_id));
+        c.anchor_coa(lot_id, "COA".to_string(), "Lab".to_string(), "tooshort".to_string(), None);
+    }
+
+    #[test]
+    fn update_party_identity_sets_gln_and_duns() {
+        let mut c = setup_with_party();
+        c.update_party_identity(
+            Some("0614141000005".to_string()),
+            Some("123456789".to_string()),
+            Some(true),
+            Some(vec![Allergen::TreeNuts, Allergen::Peanuts]),
+            Some("https://vault.example.com/acme".to_string()),
+        );
+
+        let party = c.get_party(owner()).unwrap();
+        assert_eq!(party.gs1_gln, Some("0614141000005".to_string()));
+        assert_eq!(party.duns_number, Some("123456789".to_string()));
+        assert!(party.fsma_pcqi_on_file);
+        assert_eq!(party.facility_allergens.len(), 2);
+        assert_eq!(party.data_vault_uri, Some("https://vault.example.com/acme".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "GS1 GLN must be exactly 13 digits")]
+    fn update_party_identity_rejects_short_gln() {
+        let mut c = setup_with_party();
+        c.update_party_identity(
+            Some("123456".to_string()), // too short
+            None, None, None, None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "D-U-N-S number must be exactly 9 digits")]
+    fn update_party_identity_rejects_short_duns() {
+        let mut c = setup_with_party();
+        c.update_party_identity(
+            None,
+            Some("12345".to_string()), // too short
+            None, None, None,
+        );
     }
 }

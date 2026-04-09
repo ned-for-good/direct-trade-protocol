@@ -2,7 +2,7 @@
 
 **Direct Trade Protocol — Protocol Specification**
 
-> Status: Draft | Version: 0.1 | Date: 2026-03-06
+> Status: Draft | Version: 0.2 | Date: 2026-03-10
 
 ---
 
@@ -24,31 +24,88 @@ Any platform, agent, or application that conforms to this specification can inte
 
 ## 2. Core Concepts
 
-### 2.1 Parties
+### 2.1 Identity Model
 
-A **Party** is any entity that participates in a DTP trade. Parties may be human-operated businesses or autonomous AI agents.
+Every DTP participant is identified by a **NEAR account** — a human-readable string like `acme-foods.near` or `green-valley-farm.near`. The NEAR account is the canonical identity layer: it owns cryptographic keys, signs transactions, holds USDC for escrow, and has persistent on-chain state.
+
+A **DTP Account** is a NEAR account that has registered a Party profile on the DTP contract. They are one-to-one: one account ID, one Party profile, one on-chain identity.
+
+**Key properties:**
+
+- **Role-neutral** — An account is not stamped as "buyer" or "seller" at registration. `business_type` is descriptive metadata (what kind of business you are), not a trade-role constraint. Role is declared per-trade, per-intent, and per-agreement. Any account can buy or sell.
+
+- **Cryptographic authentication** — The NEAR account keypair IS the login. When a transaction is signed from `acme-foods.near`, NEAR's runtime verifies the signature cryptographically. Wallets (NEAR Wallet, MyNearWallet, etc.) are the UX layer on top. There is no email/password at the protocol level.
+
+- **Agent sub-accounts** — NEAR supports hierarchical accounts natively. `agent.acme-foods.near` is cryptographically subordinate to `acme-foods.near`. This is the recommended pattern for agent delegation: the business owns the parent account; agents operate from sub-accounts the business controls.
+
+- **Portable by construction** — Data lives in the NEAR contract, not in any platform's database. Reputation, certifications, and trade history are readable by any DTP-compatible implementation. No platform can lock a party's identity inside their silo.
+
+- **Real-world anchoring** — The bridge between cryptographic identity and legal identity is the `KybRef` attestation (see 2.3). Optional at registration; not required for trading in v1.
+
+### 2.2 Party
+
+A **Party** is a NEAR account that has registered a profile on the DTP contract. Parties may be human-operated businesses, sole proprietors, cooperatives, or autonomous AI agents.
 
 ```json
 {
   "party_id": "string",
-  "account": "string",
   "business_name": "string",
   "business_type": "producer | distributor | retailer | cooperative | agent",
   "jurisdiction": "string",
+  "kyb": "KybRef | null",
   "certifications": ["CertificationRef"],
   "reputation": "ReputationRecord",
-  "created_at": "ISO8601"
+  "authorized_agents": ["AccountId"],
+  "created_at": "ISO8601",
+
+  "gs1_gln": "string | null",
+  "duns_number": "string | null",
+  "fsma_pcqi_on_file": "boolean",
+  "facility_allergens": ["Allergen"],
+  "data_vault_uri": "string | null"
 }
 ```
 
 **Fields:**
-- `party_id` — unique identifier (NEAR account name or DID)
-- `account` — on-chain account address for settlement
-- `business_type` — role in the supply chain
-- `certifications` — array of `CertificationRef` objects (see 2.2)
-- `reputation` — on-chain reputation record derived from completed trades (see 2.3)
+- `party_id` — NEAR account ID (the canonical identity)
+- `business_type` — descriptive classification of the business; does not restrict trade role
+- `kyb` — optional legal entity identity attestation (see 2.3)
+- `certifications` — array of `CertificationRef` objects (see 2.4)
+- `reputation` — on-chain reputation record derived from completed trades (see 2.5)
+- `authorized_agents` — NEAR accounts authorized to act on behalf of this party
+- `gs1_gln` — GS1 Global Location Number (13 digits). Required by major food retailers; embedded in FSMA 204 CTE records. Format validated on write; not externally verified by the contract.
+- `duns_number` — Dun & Bradstreet D-U-N-S Number (9 digits). Used by banks, insurers, and enterprise procurement for credit and vendor qualification.
+- `fsma_pcqi_on_file` — `true` when a Preventive Controls Qualified Individual (PCQI) attestation is on file. Required under 21 CFR Part 117 for food manufacturers and processors.
+- `facility_allergens` — allergens present in or processed at the party's facility. Distinct from product-level allergens on `GoodsCatalogEntry`. Buyers use this for cross-contact risk assessment. Values: `Milk | Eggs | Fish | Shellfish | TreeNuts | Peanuts | Wheat | Soybeans | Sesame` (FALCPA + FASTER Act 2023).
+- `data_vault_uri` — URI of the party's DTP data vault: a secure, encrypted off-chain storage service accessible via NEAR signature challenge. When set, third-party apps with permission grants can access structured business data (CRM, ERP, financial records). `null` = vault not yet configured. See [docs/PORTABLE_IDENTITY.md](docs/PORTABLE_IDENTITY.md).
 
-### 2.2 CertificationRef
+### 2.3 KybRef
+
+A `KybRef` (Know Your Business reference) optionally anchors a NEAR account to a real-world legal entity. Each Party holds at most one `KybRef`. It can be added or replaced at any time by the account holder.
+
+In v1, parties self-report their KYB data and reference an external provider's attestation. Future versions will allow KYB providers to write attestations directly to the party record.
+
+```json
+{
+  "legal_name": "string",
+  "tax_id": "string | null",
+  "jurisdiction": "string",
+  "provider": "string",
+  "attestation_ref": "string | null",
+  "issued_at": "ISO8601",
+  "expires_at": "ISO8601 | null",
+  "status": "Pending | Verified | Expired | Revoked"
+}
+```
+
+**Fields:**
+- `legal_name` — legal entity name as registered (may differ from `business_name`)
+- `tax_id` — EIN for US entities, VAT number for EU entities, etc.
+- `jurisdiction` — ISO 3166-1 alpha-2 country code of registration
+- `provider` — KYB attestation provider (e.g. `"stripe_identity"`, `"persona"`, `"manual"`)
+- `attestation_ref` — provider's attestation reference ID or verification URL
+
+### 2.4 CertificationRef  <!-- previously 2.2 -->
 
 A certification claim is never self-asserted. Every certification must carry a reference to the issuing authority and be independently verifiable.
 
@@ -73,7 +130,7 @@ A certification claim is never self-asserted. Every certification must carry a r
 - `HACCP` — Hazard Analysis Critical Control Points
 - `NON_GMO` — Non-GMO Project verified
 
-### 2.3 ReputationRecord
+### 2.5 ReputationRecord  <!-- previously 2.3 -->
 
 Reputation is built on-chain from completed trades. It cannot be manually set or imported.
 
@@ -93,7 +150,7 @@ Reputation is built on-chain from completed trades. It cannot be manually set or
 
 ---
 
-### 2.4 RelationshipRecord
+### 2.6 RelationshipRecord  <!-- previously 2.4 -->
 
 A **RelationshipRecord** captures the bilateral trade history between two specific parties. Unlike Reputation (which reflects a party's general track record across all counterparties), a RelationshipRecord reflects the specific history between Party A and Party B.
 
@@ -134,7 +191,7 @@ Tier thresholds are protocol-defined and version-controlled. Tier is visible to 
 
 ---
 
-### 2.5 StandingAgreement
+### 2.7 StandingAgreement  <!-- previously 2.5 -->
 
 A **StandingAgreement** is a long-term or recurring trading relationship formally acknowledged on-chain by both parties. It is not a single trade — it is a framework that governs a series of trades over a defined period.
 
@@ -171,6 +228,8 @@ PROPOSED → COUNTERED → ACTIVE → COMPLETED
 ```
 
 Both parties must sign (on-chain attestation) for the agreement to become `ACTIVE`. Once active, individual trades that fulfil the agreement reference it via `standing_agreement_id` and inherit its pricing and terms automatically.
+
+**ProposerRole:** The proposer declares their role in the agreement at proposal time — `Buyer` or `Seller`. Any registered account may propose in either role regardless of `business_type`. Role is per-agreement, not stamped on the account.
 
 **Effect on agent autonomy:** An agent operating under an active StandingAgreement can place orders that conform to the agreement terms autonomously — no per-trade human approval required. The agreement itself was the human approval decision.
 
@@ -688,7 +747,68 @@ In v0, the solver is a human operator or a simple scoring script. The protocol d
 
 ---
 
-## 6. Audit Trail
+## 6. FSMA Rule 204 Traceability
+
+DTP implements FDA's Food Traceability Final Rule (FSMA Rule 204, effective 2026). Every business handling items on the FDA Food Traceability List (FTL) is required to electronically maintain Key Data Elements (KDEs) at each Critical Tracking Event (CTE) boundary. DTP records these CTEs as first-class on-chain objects.
+
+### 6.1 Critical Tracking Events (CTEs)
+
+| CTE | Who records it | When |
+|---|---|---|
+| **Growing** | Farm / grower | At harvest of an FTL commodity |
+| **Creating** | First packer | When assigning a Traceability Lot Code (TLC) |
+| **Receiving** | Receiver | On arrival of a lot from another party |
+| **Transforming** | Processor | When creating a new TLC from one or more input TLCs |
+| **Shipping** | Shipper | On departure of a lot to another location |
+
+### 6.2 Fsma204Cte Schema
+
+```json
+{
+  "cte_id": "string",
+  "cte_type": "Growing | Creating | Receiving | Transforming | Shipping",
+  "lot_id": "string",
+  "output_lot_id": "string | null",
+  "actor": "AccountId",
+  "actor_gln": "string | null",
+  "source_gln": "string | null",
+  "dest_gln": "string | null",
+  "quantity_milliamount": "integer",
+  "unit": "string",
+  "commodity": "string | null",
+  "variety": "string | null",
+  "event_date_ms": "integer",
+  "recorded_at": "integer",
+  "notes": "string | null"
+}
+```
+
+**Fields:**
+- `cte_id` — unique identifier assigned by the contract
+- `cte_type` — which of the five FSMA 204 CTEs this record represents
+- `lot_id` — the DTP Traceability Lot Code (TLC) this CTE applies to
+- `output_lot_id` — for Transforming CTEs only: the new TLC produced from input TLCs
+- `actor` — the DTP account performing this CTE (packer, receiver, shipper, etc.)
+- `actor_gln` — auto-populated from the actor's `Party.gs1_gln` if set
+- `source_gln` — previous custodian's location (Receiving and Shipping CTEs)
+- `dest_gln` — destination location (Shipping CTE)
+- `event_date_ms` — actual date of the physical event (may differ from block timestamp)
+- `recorded_at` — block timestamp when this CTE was written on-chain
+
+### 6.3 Lot Traceability
+
+Each CTE is indexed by lot ID at write time, enabling instant one-up / one-down recall queries:
+
+- `get_lot_ctes(lot_id)` — returns all CTEs in which this lot appeared (as primary, source, or output)
+- `transform_lot(...)` — creates a Transforming CTE linking all input TLCs to the new output TLC, enabling full multi-ingredient traceability
+
+### 6.4 COA Anchoring
+
+Certificates of Analysis and other lot-level documents are stored off-chain (S3, IPFS). Their SHA-256 hex hash or IPFS CIDv1 is anchored on-chain via `anchor_coa(lot_id, cert_type, issuer, doc_hash, expires_at)`. This provides tamper-evident proof of document existence at a specific point in time without the cost of storing the document on-chain.
+
+---
+
+## 7. Audit Trail
 
 Every state transition in DTP emits an on-chain event. The event log is append-only and cannot be modified or deleted.
 
@@ -697,27 +817,34 @@ Every state transition in DTP emits an on-chain event. The event log is append-o
 {
   "event_id": "string",
   "event_type": "string",
-  "entity_type": "intent | offer | contract | fulfillment | settlement",
+  "entity_type": "Intent | Listing | Offer | Contract | Fulfillment | Settlement | StandingAgreement | Relationship | Catalog | Lot | FinancePool | Party | Fsma204Cte",
   "entity_id": "string",
   "actor": "string",
-  "timestamp": "ISO8601",
+  "timestamp": "integer",
   "payload_hash": "string"
 }
 ```
 
-`payload_hash` is a SHA-256 hash of the full event payload, enabling independent verification.
+`payload_hash` is a SHA-256 hash of the canonical JSON payload, enabling independent verification.
+
+**Event types include:**
+- Trade lifecycle: `IntentPosted`, `IntentCancelled`, `ListingActivated`, `ListingWithdrawn`, `OfferSubmitted`, `OfferAccepted`, `ContractCreated`, `ContractEscrowLocked`, `ContractSettled`, `ContractDisputed`, etc.
+- Lot lifecycle: `LotCreated`, `LotDisposed`, `LotOwnershipTransferred`, `LotTransformed`, `LotCOAAnchored`
+- FSMA traceability: `Fsma204CteRecorded`
+- Party identity: `PartyIdentityUpdated`
+- Finance: `FinancePoolRegistered`, `FinancingRequested`, `FinancingConfirmed`
 
 ---
 
-## 7. Versioning
+## 8. Versioning
 
 DTP is versioned. Every message carries a `version` field. Breaking changes increment the major version. Implementations must reject messages with incompatible versions.
 
-Current version: `0.1`
+Current version: `0.2`
 
 ---
 
-## 8. Reference Implementation
+## 10. Reference Implementation
 
 The canonical reference implementation consists of:
 
@@ -728,13 +855,13 @@ Implementors are not required to use the reference contracts or SDK. Any conform
 
 ---
 
-## 9. Agent Autonomy Context
+## 11. Agent Autonomy Context
 
 DTP is designed for both human-operated and agent-operated parties. To enable autonomous agent behavior, each party may maintain a private **Agent Autonomy Context** — a set of parameters that governs how their agent acts on their behalf.
 
 **Agent Autonomy Context is not a protocol message.** It is never transmitted, never stored on-chain, and never visible to the counterparty. It is private configuration held by the party's agent.
 
-### 9.1 Seller Agent Context
+### 11.1 Seller Agent Context
 
 ```json
 {
@@ -754,7 +881,7 @@ The seller's agent derives its floor price from `cogs_per_unit` and `minimum_mar
 
 **Buyers never see COGS, floor price, or margin guidelines.** They see only the published asking price and tiers.
 
-### 9.2 Buyer Agent Context
+### 11.2 Buyer Agent Context
 
 The buyer's agent operates like an internal procurement officer: it knows the company's economics, inventory position, supplier history, and spending authority — and negotiates on behalf of the company without exposing any of that to the seller.
 
@@ -815,13 +942,13 @@ The buyer's agent operates like an internal procurement officer: it knows the co
 
 **`negotiation_guidelines`** — defines the boundary of autonomous action. Within these bounds the agent acts without human input. Outside them it escalates.
 
-### 9.3 TEE Integration
+### 11.3 TEE Integration
 
 In deployments using NEAR AI Cloud's Trusted Execution Environment (TEE), Agent Autonomy Context runs inside hardware-secured infrastructure where the context is encrypted and isolated — even the infrastructure operator cannot read it. This is the recommended deployment model for production agent autonomy.
 
 ---
 
-## 10. Out of Scope (v0)
+## 12. Out of Scope (v1)
 
 The following are explicitly out of scope for DTP v0 and may be addressed in future versions:
 
